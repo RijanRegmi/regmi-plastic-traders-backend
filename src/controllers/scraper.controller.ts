@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
-import puppeteer, { Browser } from 'puppeteer';
+import puppeteer, { Browser } from 'puppeteer-core';
+import chromium from '@sparticuz/chromium';
 
 interface DarazProduct {
   name: string;
@@ -23,15 +24,21 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
   let browser: Browser | null = null;
 
   try {
+    const isVercel = process.env.VERCEL === '1' || process.env.NODE_ENV === 'production';
+    
     browser = await puppeteer.launch({
-      headless: true,
-      args: [
+      args: isVercel ? chromium.args : [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
         '--window-size=1366,768',
       ],
+      defaultViewport: chromium.defaultViewport,
+      executablePath: isVercel 
+        ? await chromium.executablePath() 
+        : (process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'),
+      headless: isVercel ? (chromium.headless as unknown as boolean) : true,
     });
 
     const page = await browser.newPage();
