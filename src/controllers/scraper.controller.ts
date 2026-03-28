@@ -83,8 +83,6 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       const getText = (sel: string): string =>
         (document.querySelector(sel) as HTMLElement | null)?.textContent?.trim() || '';
 
-      const getNum = (text: string): number =>
-        parseFloat(text.replace(/[^0-9.]/g, '')) || 0;
 
       // ── Name ──────────────────────────────────────────────────────────────
       const name =
