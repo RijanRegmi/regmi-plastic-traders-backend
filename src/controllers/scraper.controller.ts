@@ -58,13 +58,13 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
 
     const cleanUrl = url.split('?')[0].replace(/\/$/, '') + '.html';
 
-    await page.goto(cleanUrl, { waitUntil: 'networkidle2', timeout: 35000 });
+    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
     
-    // Give more time on Vercel for JS components to render
-    const extraWait = isVercel ? 6000 : 3000;
-    await new Promise(r => setTimeout(r, extraWait));
+    // Give time for JS to start rendering — faster on local, longer on Vercel
+    const initialWait = isVercel ? 5000 : 2000;
+    await new Promise(r => setTimeout(r, initialWait));
     
-    // Scroll to trigger lazy loading of ratings/prices
+    // Scroll and wait slightly more for JS components (price/rating) 
     await page.evaluate(() => window.scrollBy(0, 1000));
     await new Promise(r => setTimeout(r, 2000));
 
@@ -250,21 +250,54 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       ).map(el => (el as HTMLElement).textContent?.trim() || '');
       const category = crumbs.filter(c => c && c.toLowerCase() !== 'home').pop() || '';
 
-      // ── Meta Tags (MOST RELIABLE FOR PRICE) ─────────────────────────────
+      // ── Meta & JSON-LD (THE GOLD STANDARD) ─────────────────────────────
       const getMeta = (prop: string): string =>
         document.querySelector(`meta[property="${prop}"]`)?.getAttribute('content') ||
         document.querySelector(`meta[name="${prop}"]`)?.getAttribute('content') || '';
 
-      const metaPrice = parseFloat(getMeta('og:price:amount') || getMeta('product:price:amount') || '0');
+      // Extract from LD+JSON (Technical SEO data)
+      const ldJsonData: { price?: number; rating?: number; reviewCount?: number } = {};
+      try {
+        const ldScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+        for (const s of ldScripts) {
+          const json = JSON.parse(s.textContent || '{}');
+          const findProduct = (obj: unknown): Record<string, unknown> | null => {
+            if (!obj || typeof obj !== 'object') return null;
+            const o = obj as Record<string, unknown>;
+            if (o["@type"] === "Product") return o;
+            if (Array.isArray(o)) {
+              return (o as Record<string, unknown>[]).find(x => x && typeof x === 'object' && (x as Record<string, unknown>)["@type"] === "Product") || null;
+            }
+            if (o["@graph"] && Array.isArray(o["@graph"])) {
+              return (o["@graph"] as Record<string, unknown>[]).find(x => x && typeof x === 'object' && (x as Record<string, unknown>)["@type"] === "Product") || null;
+            }
+            return null;
+          };
+          const p = findProduct(json);
+          if (p) {
+             const offers = p.offers;
+             const offer = (Array.isArray(offers) ? offers[0] : offers) as Record<string, unknown> | undefined;
+             if (offer?.price) ldJsonData.price = parseFloat(String(offer.price));
+             const ratingObj = p.aggregateRating as Record<string, unknown> | undefined;
+             if (ratingObj) {
+                ldJsonData.rating = parseFloat(String(ratingObj.ratingValue));
+                ldJsonData.reviewCount = parseInt(String(ratingObj.reviewCount), 10);
+             }
+             break;
+          }
+        }
+      } catch { /* ignore */ }
 
+      const metaPrice = parseFloat(getMeta('og:price:amount') || getMeta('product:price:amount') || getMeta('price') || '0');
+      
       return { 
         name, 
-        price: price || (metaPrice > 0 ? metaPrice : null), 
+        price: price || ldJsonData.price || (metaPrice > 0 ? metaPrice : null), 
         originalPrice, 
         description, 
         images: images.slice(0, 10), 
-        rating, 
-        reviewCount, 
+        rating: rating || ldJsonData.rating || 0, 
+        reviewCount: reviewCount || ldJsonData.reviewCount || 0, 
         category, 
         rawPrices, 
         rawRatings 
