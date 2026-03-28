@@ -44,348 +44,164 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
 
     const page = await browser.newPage();
 
+    // Specific desktop User-Agent to ensure desktop layout
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+    );
+    await page.setViewport({ width: 1366, height: 768 });
+
+    // Bypass simple bot checks
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      (window as Window & { chrome?: object }).chrome = { runtime: {} };
+      (window as unknown as { chrome: object }).chrome = { runtime: {} };
     });
-
-    await page.setViewport({ width: 1366, height: 768 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    );
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
     const baseUrl = url.split('?')[0].replace(/\/$/, '');
     const cleanUrl = baseUrl.endsWith('.html') ? baseUrl : `${baseUrl}.html`;
 
     console.log(`[Scraper] Navigating to: ${cleanUrl}`);
-    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-    
-    // Give time for JS to start rendering — faster on local, longer on Vercel
-    const initialWait = isVercel ? 5000 : 2000;
-    await new Promise(r => setTimeout(r, initialWait));
-    
-    // Scroll and wait slightly more for JS components (price/rating) 
-    await page.evaluate(() => window.scrollBy(0, 1000));
-    await new Promise(r => setTimeout(r, 2000));
+    await page.goto(cleanUrl, { 
+      waitUntil: isVercel ? 'domcontentloaded' : 'networkidle2', 
+      timeout: 25000 
+    });
 
-    const result = await page.evaluate((): {
-      name: string;
-      price: number | null;
-      originalPrice: number | null;
-      description: string;
-      images: string[];
-      rating: number;
-      reviewCount: number;
-      category: string;
-      rawPrices: string[];
-      rawRatings: string[];
-    } => {
-      const getText = (sel: string): string =>
-        (document.querySelector(sel) as HTMLElement | null)?.textContent?.trim() || '';
+    // Strategy: Wait for hydration
+    try {
+      console.log(`[Scraper] Waiting for hydration indicators...`);
+      await Promise.race([
+        page.waitForSelector('.pdp-price', { timeout: 12000 }),
+        page.waitForSelector('.score-average', { timeout: 12000 }),
+        new Promise(r => setTimeout(r, 8000))
+      ]);
+      await new Promise(r => setTimeout(r, 1000));
+    } catch {
+      console.log(`[Scraper] Wait indicators timed out, proceeding.`);
+    }
 
+    const data = await page.evaluate(() => {
+      const result = {
+        name: '', 
+        price: null as number | null, 
+        originalPrice: null as number | null, 
+        description: '',
+        images: [] as string[], 
+        rating: 0, 
+        reviewCount: 0, 
+        category: '', 
+        source: 'none'
+      };
 
-      // ── Name ──────────────────────────────────────────────────────────────
-      const name =
-        getText('.pdp-mod-product-badge-title') ||
-        getText('h1.pdp-product-title') ||
-        getText('[class*="product-title"]') ||
-        getText('h1');
-
-      // ── Price & Original Price ─────────────────────────────────────────────
-      const rawPrices: string[] = [];
-      const allText = document.body.innerText;
-
-      // Get all Rs. numbers from page
-      const allRsMatches = allText.match(/Rs\.?\s*([\d,]+)/gi) || [];
-      rawPrices.push(...allRsMatches.slice(0, 5));
-
-      const rsNumbers = allRsMatches
-        .map(m => parseFloat(m.replace(/Rs\.?\s*/i, '').replace(/,/g, '')))
-        .filter(n => n > 10 && n < 10000000);
-
-      // Check 1: explicit <del> or strikethrough CSS class
-      let originalPrice: number | null = null;
-      const delEl =
-        document.querySelector('.pdp-price_type_deleted') ||
-        document.querySelector('[class*="pdp-price_type_deleted"]') ||
-        document.querySelector('[class*="price-del"]') ||
-        document.querySelector('[class*="price-original"]') ||
-        document.querySelector('del') ||
-        document.querySelector('s');
-
-      if (delEl) {
-        const text = delEl.textContent || '';
-        const n = parseFloat(text.replace(/Rs\.?\s*/i, '').replace(/,/g, '').replace(/[^0-9.]/g, ''));
-        if (n > 0) originalPrice = n;
-      }
-
-      // Check 2: if no del element, look for "-N%" discount pattern or a price that is obviously large
-      if (!originalPrice) {
-        const discountMatch = allText.match(/Rs\.?\s*[\d,]+-\d+%/i);
-        if (discountMatch && rsNumbers.length >= 2) {
-          originalPrice = Math.max(rsNumbers[0], rsNumbers[1]);
-        }
-      }
-
-      // ── Sale Price — REFINED ──────────────────────────────────────────────
-      const salePriceEl =
-        document.querySelector('.pdp-price_type_normal') ||
-        document.querySelector('[class*="pdp-product-price"]') ||
-        document.querySelector('.pdp-mod-product-price .pdp-price');
-
-      let price: number | null = null;
-      if (salePriceEl) {
-        const text = salePriceEl.textContent || '';
-        const n = parseFloat(text.replace(/Rs\.?\s*/i, '').replace(/,/g, '').replace(/[^0-9.]/g, ''));
-        if (n > 0) price = n;
-      }
-
-      // Fallback: use first Rs. number if element search failed
-      if (!price && rsNumbers.length > 0) {
-        price = rsNumbers[0];
-      }
-
-      // Ensure originalPrice > price
-      if (originalPrice && price && originalPrice <= price) {
-        originalPrice = null;
-      }
-      // If neither condition met → product has no discount → originalPrice stays null
-
-      // ── Rating — UNCHANGED ────────────────────────────────────────────────
-      const rawRatings: string[] = [];
-      const ratingSelectors = [
-        '[class*="score-average"]',
-        '[class*="rating-average"]',
-        '[class*="average-score"]',
-        '[class*="pdp-review-summary"]',
-        '[class*="review-score"]',
-        '[class*="star-score"]',
-      ];
-      for (const sel of ratingSelectors) {
-        const el = document.querySelector(sel);
-        if (el) rawRatings.push(`${sel}=${el.textContent?.trim()}`);
-      }
-
-      const ratingMatch = document.body.innerText.match(/(\d\.\d)\s*\/\s*5/);
-      if (ratingMatch) rawRatings.push(`MATCH=${ratingMatch[1]}`);
-
-      let rating = 0;
-      for (const sel of ratingSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const text = el.textContent?.trim() || '0';
-          // Split on slash for "4.7 / 5"
-          const cleanText = text.split('/')[0].trim();
-          const n = parseFloat(cleanText);
-          if (n > 0 && n <= 5) { rating = n; break; }
-        }
-      }
-
-      if (!rating && ratingMatch) {
-         rating = parseFloat(ratingMatch[1]);
-      }
-
-      // ── Review count — UNCHANGED ──────────────────────────────────────────
-      const reviewSelectors = [
-        '.pdp-review-summary__link',
-        '[class*="rating-count"]',
-        '[class*="review-count"]',
-        '[class*="total-rating"]',
-        '[class*="pdp-review-count"]',
-      ];
-      let reviewCount = 0;
-      for (const sel of reviewSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const text = (el.textContent || '').trim();
-          const n = parseInt(text.replace(/[^0-9]/g, ''));
-          if (n > 0) { reviewCount = n; break; }
-        }
-      }
-      // Daraz shows "9 Ratings" cleanly — use that format, not "Ratings 9 10 Answered Questions"
-      // Also try "Ratings 4" for products where it appears on its own line
-      const ratingsMatch1 = document.body.innerText.match(/\b(\d{1,5})\s+Ratings?\b/i);
-      const ratingsMatch2 = document.body.innerText.match(/\bRatings?\s+(\d{1,4})\b(?!\s*\d)/i);
-      const ratingsRaw = ratingsMatch1
-        ? parseInt(ratingsMatch1[1])
-        : ratingsMatch2 ? parseInt(ratingsMatch2[1]) : 0;
-      if (!reviewCount && ratingsRaw > 0 && ratingsRaw <= 100000) reviewCount = ratingsRaw;
-
-      // ── Images — UNCHANGED ────────────────────────────────────────────────
-      const images: string[] = [];
-      document.querySelectorAll(
-        '.item-gallery__thumbnail img, [class*="gallery-preview-panel"] img, [class*="gallery"] img'
-      ).forEach((el) => {
-        const img = el as HTMLImageElement;
-        const src = img.src || img.dataset.src || '';
-        if (src && src.includes('http') && !src.includes('placeholder') && !src.includes('blank')) {
-          const hq = src.replace(/_\d+x\d+/, '_800x800').split('?')[0];
-          if (!images.includes(hq)) images.push(hq);
-        }
-      });
-      if (images.length === 0) {
-        document.querySelectorAll('img').forEach((el) => {
-          const img = el as HTMLImageElement;
-          const src = img.src || img.dataset.src || '';
-          if ((src.includes('img.lazcdn') || src.includes('static.daraz')) && !src.includes('thumb')) {
-            const hq = src.replace(/_\d+x\d+/, '_800x800').split('?')[0];
-            if (!images.includes(hq)) images.push(hq);
-          }
-        });
-      }
-
-      // ── Description — UNCHANGED ───────────────────────────────────────────
-      const descEl =
-        document.querySelector('.html-content') ||
-        document.querySelector('[class*="product-detail"]') ||
-        document.querySelector('[class*="description-content"]');
-      const description = (descEl?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 600);
-
-      // ── Category — UNCHANGED ──────────────────────────────────────────────
-      // ── Category — RE-ADDED ──────────────────────────────────────────────
-      const crumbs = Array.from(
-        document.querySelectorAll('[class*="breadcrumb"] a, nav a')
-      ).map(el => (el as HTMLElement).textContent?.trim() || '');
-      const category = crumbs.filter(c => c && c.toLowerCase() !== 'home').pop() || '';
-
-      // ── Meta & JSON-LD (THE GOLD STANDARD) ─────────────────────────────
-      const getMeta = (prop: string): string =>
-        document.querySelector(`meta[property="${prop}"]`)?.getAttribute('content') ||
-        document.querySelector(`meta[name="${prop}"]`)?.getAttribute('content') || '';
-
-      // Extract from LD+JSON (Technical SEO data)
-      const ldJsonData: { price?: number; rating?: number; reviewCount?: number } = {};
+      // 1. JSON-LD
       try {
         const ldScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
         for (const s of ldScripts) {
           const json = JSON.parse(s.textContent || '{}');
-          const findProduct = (obj: unknown): Record<string, unknown> | null => {
-            if (!obj || typeof obj !== 'object') return null;
-            const o = obj as Record<string, unknown>;
-            if (o["@type"] === "Product") return o;
-            if (Array.isArray(o)) {
-              return (o as Record<string, unknown>[]).find(x => x && typeof x === 'object' && (x as Record<string, unknown>)["@type"] === "Product") || null;
-            }
-            if (o["@graph"] && Array.isArray(o["@graph"])) {
-              return (o["@graph"] as Record<string, unknown>[]).find(x => x && typeof x === 'object' && (x as Record<string, unknown>)["@type"] === "Product") || null;
-            }
-            return null;
-          };
-          const p = findProduct(json);
+          const p = Array.isArray(json) ? json.find(x => x["@type"] === "Product") : (json["@type"] === "Product" ? json : null);
           if (p) {
-             const offers = p.offers;
-             const offer = (Array.isArray(offers) ? offers[0] : offers) as Record<string, unknown> | undefined;
-             if (offer?.price) ldJsonData.price = parseFloat(String(offer.price));
-             const ratingObj = p.aggregateRating as Record<string, unknown> | undefined;
-             if (ratingObj) {
-                ldJsonData.rating = parseFloat(String(ratingObj.ratingValue));
-                ldJsonData.reviewCount = parseInt(String(ratingObj.reviewCount), 10);
-             }
-             break;
+            result.name = p.name || result.name;
+            if (p.offers) {
+              const offer = Array.isArray(p.offers) ? p.offers[0] : p.offers;
+              result.price = parseFloat(offer.price) || result.price;
+            }
+            if (p.aggregateRating) {
+              result.rating = parseFloat(p.aggregateRating.ratingValue) || result.rating;
+              result.reviewCount = parseInt(p.aggregateRating.reviewCount) || result.reviewCount;
+            }
+            result.source = 'json-ld';
           }
         }
-      } catch { /* ignore */ }
+      } catch {}
 
-      const metaPrice = parseFloat(getMeta('og:price:amount') || getMeta('product:price:amount') || getMeta('price') || '0');
-      
-      return { 
-        name, 
-        price: price || ldJsonData.price || (metaPrice > 0 ? metaPrice : null), 
-        originalPrice, 
-        description, 
-        images: images.slice(0, 10), 
-        rating: rating || ldJsonData.rating || 0, 
-        reviewCount: reviewCount || ldJsonData.reviewCount || 0, 
-        category, 
-        rawPrices, 
-        rawRatings 
-      };
-    });
-
-    // ── Also try window.__item__ JSON — UNCHANGED ─────────────────────────────
-    const jsonData = await page.evaluate((): {
-      name: string; price: number | null; description: string;
-      images: string[]; rating: number; reviewCount: number;
-    } | null => {
+      // 2. Initial State
       try {
         const scripts = Array.from(document.querySelectorAll('script'));
-        for (const script of scripts) {
-          const content = script.textContent || '';
-          
-          // Try __INITIAL_STATE__ (newer Daraz/Lazada/AliExpress format)
+        for (const s of scripts) {
+          const content = s.textContent || '';
           if (content.includes('__INITIAL_STATE__')) {
-            const m = content.match(/__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});/m);
-            if (m?.[1]) {
-               const state = JSON.parse(m[1]);
-               const p = state.product || state || {};
-               return {
-                 name:        String(p.name || p.title || ''),
-                 price:       parseFloat(p.price || p.salePrice || '0') || null,
-                 description: String(p.description || p.highlights || '').replace(/<[^>]+>/g, ' ').slice(0, 600),
-                 images:      (p.images || []).map((i: string) => String(i).split('?')[0]).slice(0, 10),
-                 rating:      parseFloat(p.ratingValue || p.rating || '0') || 0,
-                 reviewCount: parseInt(p.reviewCount || '0') || 0,
-               };
-            }
-          }
-
-          // Try __item__ (traditional format)
-          if (content.includes('__item__')) {
-            const m = content.match(/__item__\s*=\s*(\{[\s\S]*?\});/m);
-            if (m?.[1]) {
-              const j = JSON.parse(m[1]);
-              const imgSrc = j.image;
-              const imgList: string[] = Array.isArray(imgSrc) ? imgSrc : imgSrc ? [imgSrc] : [];
-              const images = imgList
-                .map((i: string) => String(i).replace(/_\d+x\d+/, '_800x800').split('?')[0])
-                .filter(Boolean)
-                .slice(0, 10);
-              let price = parseFloat(String(j.price || '0').replace(/[^0-9.]/g, '')) || null;
-              if (price && price > 100000) price = price / 100;
-              return {
-                name:        String(j.name || j.title || ''),
-                price,
-                description: String(j.description || j.highlights || '')
-                  .replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 600),
-                images,
-                rating:      parseFloat(String(j.ratingScore || j.rating || '0')) || 0,
-                reviewCount: parseInt(String(j.review || j.reviewCount || '0')) || 0,
-              };
+            const match = content.match(/__INITIAL_STATE__\s*=\s*({.*?});(?:<\/script>|var|window)/s);
+            if (match) {
+              const state = JSON.parse(match[1]);
+              const p = state.product || state || {};
+              result.name = p.name || p.title || result.name;
+              result.price = parseFloat(p.price || p.salePrice || p.skuPrice?.price) || result.price;
+              if (p.ratingValue || p.rating || p.reviewSummary?.score) {
+                result.rating = parseFloat(p.ratingValue || p.rating || p.reviewSummary?.score) || result.rating;
+              }
+              if (p.reviewCount || p.reviewSummary?.totalReview) {
+                result.reviewCount = parseInt(p.reviewCount || p.reviewSummary?.totalReview) || result.reviewCount;
+              }
+              result.source = 'initial-state';
             }
           }
         }
-      } catch { /* ignore */ }
-      return null;
+      } catch {}
+
+      // 3. DOM Fallbacks
+      const getText = (s: string) => (document.querySelector(s) as HTMLElement)?.textContent?.trim() || '';
+      
+      if (!result.name) result.name = getText('.pdp-mod-product-badge-title') || getText('h1');
+      
+      if (!result.price) {
+        const pEl = document.querySelector('.pdp-price') || document.querySelector('[class*="pdp-product-price"]');
+        if (pEl) result.price = parseFloat(pEl.textContent?.replace(/[^0-9.]/g, '') || '0') || null;
+      }
+
+      const delEl = document.querySelector('.pdp-price_type_deleted') || document.querySelector('del');
+      if (delEl) result.originalPrice = parseFloat(delEl.textContent?.replace(/[^0-9.]/g, '') || '0') || null;
+
+      if (!result.rating) {
+        const rEl = document.querySelector('.score-average') || document.querySelector('[class*="rating-average"]');
+        if (rEl) result.rating = parseFloat(rEl.textContent || '0') || 0;
+      }
+
+      if (!result.reviewCount) {
+        const cEl = document.querySelector('.pdp-review-summary__link') || document.querySelector('.count');
+        if (cEl) result.reviewCount = parseInt(cEl.textContent?.replace(/[^0-9]/g, '') || '0') || 0;
+      }
+
+      // Images
+      const imgs: string[] = [];
+      document.querySelectorAll('.item-gallery__thumbnail img, .pdp-mod-common-gallery img').forEach((el) => {
+        const src = (el as HTMLImageElement).src || (el as HTMLImageElement).dataset.src;
+        if (src && src.includes('http') && !src.includes('placeholder')) {
+          const hq = src.replace(/_\d+x\d+/, '_800x800').split('?')[0];
+          if (!imgs.includes(hq)) imgs.push(hq);
+        }
+      });
+      result.images = imgs.length ? imgs : result.images;
+
+      // Description
+      const dEl = document.querySelector('.html-content') || document.querySelector('#product_detail');
+      if (dEl) result.description = dEl.textContent?.replace(/\s+/g, ' ').trim().slice(0, 500) || '';
+
+      // Category
+      const crumbs = Array.from(document.querySelectorAll('.breadcrumb_item')).map(el => el.textContent?.trim() || '');
+      result.category = crumbs.filter(c => c && c.toLowerCase() !== 'home').pop() || '';
+
+      return result;
     });
 
-    console.log('[Scraper] Price candidates:', result.rawPrices.slice(0, 5));
-    console.log('[Scraper] Rating candidates:', result.rawRatings.slice(0, 5));
-    console.log('[Scraper] originalPrice:', result.originalPrice);
+    console.log(`[Scraper] Done. Source: ${data.source}`);
 
-    const name        = result.name        || jsonData?.name        || '';
-    // Priority: DOM/Meta > JSON Fallback
-    const price       = result.price       || jsonData?.price       || null; 
-    const description = result.description || jsonData?.description || '';
-    const rating      = result.rating      || jsonData?.rating      || 0;
-    const reviewCount = result.reviewCount || jsonData?.reviewCount || 0;
-    const images      = result.images.length ? result.images : (jsonData?.images || []);
-
-    if (!name) {
-      return { ...empty, error: 'Could not extract product data. The page may have changed.' };
+    if (!data.name && !data.price) {
+      return { ...empty, error: 'Could not extract data. Layout may have changed.' };
     }
 
     return {
-      name, price,
-      originalPrice: result.originalPrice, // null if no discount
-      description, images, rating, reviewCount,
-      category: result.category, success: true,
+      name: data.name,
+      price: data.price,
+      originalPrice: data.originalPrice,
+      description: data.description,
+      images: data.images.slice(0, 10),
+      rating: data.rating,
+      reviewCount: data.reviewCount,
+      category: data.category,
+      success: true,
     };
 
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[Scraper] Error: ${msg}`);
     return { ...empty, error: `Scrape failed: ${msg}` };
   } finally {
     if (browser) await browser.close();
@@ -402,9 +218,10 @@ export class ScraperController {
       }
       console.log(`[Scraper] Fetching: ${url}`);
       const data = await scrapeWithPuppeteer(url);
-      console.log(`[Scraper] Result: name="${data.name}" price=${data.price} originalPrice=${data.originalPrice} rating=${data.rating} reviews=${data.reviewCount} images=${data.images.length}`);
       res.json({ success: true, data });
-    } catch (err) { next(err); }
+    } catch (err) { 
+      next(err); 
+    }
   }
 }
 
