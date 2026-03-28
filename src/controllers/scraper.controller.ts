@@ -39,13 +39,12 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       executablePath: isVercel
         ? await chromium.executablePath()
         : (process.env.CHROME_PATH || 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe'),
-      headless: isVercel ? (chromium.headless as unknown as boolean) : true,
+      headless: true,
     });
 
     const page = await browser.newPage();
 
     // Block images, fonts, and stylesheets on Vercel to save time/memory budget
-    // so more CPU time is available for JS hydration
     if (isVercel) {
       await page.setRequestInterception(true);
       page.on('request', (req) => {
@@ -58,7 +57,7 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       });
     }
 
-    // Desktop User-Agent to ensure desktop layout
+    // Desktop User-Agent
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     );
@@ -79,25 +78,23 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       timeout: 25000,
     });
 
-    // --- Aggressive hydration wait ---
-    // On Vercel, price/rating are rendered by React/Vue after JS executes.
-    // We wait until the price element actually contains numeric content,
-    // not just until the selector exists in the DOM.
+    // Wait until the price element has numeric content >= 3 digits (e.g. 100+)
+    // This avoids grabbing tiny decimal prices from hidden elements
     console.log(`[Scraper] Waiting for JS hydration of price/rating...`);
     try {
       await Promise.race([
-        // Wait for price element to have real numeric content
         page.waitForFunction(
           () => {
             const selectors = [
+              '.pdp-price_type_normal',
+              '.pdp-price_color_orange',
               '.pdp-price',
-              '[class*="pdp-product-price"]',
-              '[class*="pdp-price"]',
             ];
             for (const sel of selectors) {
               const el = document.querySelector(sel);
               if (el && el.textContent) {
                 const digits = el.textContent.replace(/[^0-9]/g, '');
+                // Must have at least 2 digits to be a real price (not 0.55 type junk)
                 if (digits.length >= 2) return true;
               }
             }
@@ -105,7 +102,6 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
           },
           { timeout: 18000, polling: 300 }
         ),
-        // Hard fallback — don't wait forever
         new Promise<void>((resolve) => setTimeout(resolve, 15000)),
       ]);
       console.log(`[Scraper] Price hydration detected.`);
@@ -129,6 +125,13 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         source: 'none',
       };
 
+      // Helper to clean and parse price text like "Rs. 5,500" → 5500
+      const parsePrice = (text: string): number => {
+        // Remove currency symbols, spaces, commas — keep digits and dot
+        const cleaned = text.replace(/[^0-9.]/g, '');
+        return parseFloat(cleaned) || 0;
+      };
+
       // 1. JSON-LD (most reliable when present)
       try {
         const ldScripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
@@ -141,7 +144,9 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
             result.name = p.name || result.name;
             if (p.offers) {
               const offer = Array.isArray(p.offers) ? p.offers[0] : p.offers;
-              result.price = parseFloat(offer.price) || result.price;
+              const jsonPrice = parseFloat(offer.price) || 0;
+              // JSON-LD sometimes gives a tiny decimal — only trust if >= 1
+              if (jsonPrice >= 1) result.price = jsonPrice;
             }
             if (p.aggregateRating) {
               result.rating = parseFloat(p.aggregateRating.ratingValue) || result.rating;
@@ -163,7 +168,8 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
               const state = JSON.parse(match[1]);
               const p = state.product || state || {};
               result.name = p.name || p.title || result.name;
-              result.price = parseFloat(p.price || p.salePrice || p.skuPrice?.price) || result.price;
+              const statePrice = parseFloat(p.price || p.salePrice || p.skuPrice?.price) || 0;
+              if (statePrice >= 1) result.price = statePrice;
               if (p.ratingValue || p.rating || p.reviewSummary?.score) {
                 result.rating = parseFloat(p.ratingValue || p.rating || p.reviewSummary?.score) || result.rating;
               }
@@ -176,7 +182,9 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         }
       } catch { /* ignore */ }
 
-      // 3. DOM Fallbacks — run these regardless so we can fill gaps
+      // 3. DOM Fallbacks
+
+      // Name
       const getText = (sel: string) =>
         (document.querySelector(sel) as HTMLElement)?.textContent?.trim() || '';
 
@@ -184,19 +192,20 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         result.name = getText('.pdp-mod-product-badge-title') || getText('h1');
       }
 
-      // Price DOM fallback — try multiple known selectors
+      // --- PRICE DOM FALLBACK ---
+      // Priority order: normal sale price first, then generic pdp-price
+      // Skip any element with a tiny value (< 1) — those are USD or junk decimals
       if (!result.price) {
         const priceSelectors = [
-          '.pdp-price',
-          '[class*="pdp-product-price"]',
-          '[class*="pdp-price_type_normal"]',
-          '[class*="pdp-price"]',
+          '.pdp-price_type_normal',        // main sale price on Daraz NP
+          '.pdp-price_color_orange',       // highlighted orange price
+          '.pdp-price_size_xl',            // large price display
         ];
         for (const sel of priceSelectors) {
           const el = document.querySelector(sel);
           if (el && el.textContent) {
-            const parsed = parseFloat(el.textContent.replace(/[^0-9.]/g, ''));
-            if (parsed > 0) {
+            const parsed = parsePrice(el.textContent);
+            if (parsed >= 1) {
               result.price = parsed;
               break;
             }
@@ -204,30 +213,39 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         }
       }
 
-      // Original / crossed-out price
+      // --- ORIGINAL / CROSSED-OUT PRICE ---
       if (!result.originalPrice) {
-        const delEl =
-          document.querySelector('.pdp-price_type_deleted') ||
-          document.querySelector('del');
-        if (delEl && delEl.textContent) {
-          const parsed = parseFloat(delEl.textContent.replace(/[^0-9.]/g, ''));
-          if (parsed > 0) result.originalPrice = parsed;
+        const origSelectors = [
+          '.pdp-price_type_deleted',
+          '.pdp-price_type_deleted span',
+          'del',
+        ];
+        for (const sel of origSelectors) {
+          const el = document.querySelector(sel);
+          if (el && el.textContent) {
+            const parsed = parsePrice(el.textContent);
+            if (parsed >= 1) {
+              result.originalPrice = parsed;
+              break;
+            }
+          }
         }
       }
 
-      // Rating DOM fallback
+      // --- RATING DOM FALLBACK ---
       if (!result.rating) {
         const ratingSelectors = [
           '.score-average',
-          '[class*="rating-average"]',
           '[class*="score-average"]',
-          '[class*="pdp-review-summary"] [class*="average"]',
+          '[class*="rating-average"]',
+          // Daraz NP sometimes puts it here
+          '.pdp-review-summary .score-average',
         ];
         for (const sel of ratingSelectors) {
           const el = document.querySelector(sel);
           if (el && el.textContent) {
             const parsed = parseFloat(el.textContent.trim());
-            if (parsed > 0) {
+            if (parsed > 0 && parsed <= 5) {
               result.rating = parsed;
               break;
             }
@@ -235,7 +253,7 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         }
       }
 
-      // Review count DOM fallback
+      // --- REVIEW COUNT DOM FALLBACK ---
       if (!result.reviewCount) {
         const countSelectors = [
           '.pdp-review-summary__link',
@@ -254,7 +272,27 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         }
       }
 
-      // Images
+      // --- DESCRIPTION ---
+      // Try multiple known description containers on Daraz
+      const descSelectors = [
+        '.html-content',
+        '#product_detail',
+        '.pdp-product-desc',
+        '[class*="product-detail"]',
+        '.pdp-mod-spec',
+      ];
+      for (const sel of descSelectors) {
+        const el = document.querySelector(sel);
+        if (el && el.textContent) {
+          const text = el.textContent.replace(/\s+/g, ' ').trim();
+          if (text.length > 10) {
+            result.description = text.slice(0, 500);
+            break;
+          }
+        }
+      }
+
+      // --- IMAGES ---
       const imgs: string[] = [];
       document
         .querySelectorAll('.item-gallery__thumbnail img, .pdp-mod-common-gallery img')
@@ -267,15 +305,7 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         });
       result.images = imgs.length ? imgs : result.images;
 
-      // Description
-      const dEl =
-        document.querySelector('.html-content') ||
-        document.querySelector('#product_detail');
-      if (dEl) {
-        result.description = dEl.textContent?.replace(/\s+/g, ' ').trim().slice(0, 500) || '';
-      }
-
-      // Category from breadcrumbs
+      // --- CATEGORY from breadcrumbs ---
       const crumbs = Array.from(
         document.querySelectorAll('.breadcrumb_item')
       ).map((el) => el.textContent?.trim() || '');
@@ -284,7 +314,7 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       return result;
     });
 
-    console.log(`[Scraper] Done. Source: ${data.source}, price: ${data.price}, rating: ${data.rating}`);
+    console.log(`[Scraper] Done. Source: ${data.source}, price: ${data.price}, rating: ${data.rating}, reviews: ${data.reviewCount}`);
 
     if (!data.name && !data.price) {
       return { ...empty, error: 'Could not extract data. Layout may have changed.' };
