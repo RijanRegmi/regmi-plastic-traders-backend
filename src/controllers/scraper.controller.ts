@@ -100,13 +100,10 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         .map(m => parseFloat(m.replace(/Rs\.?\s*/i, '').replace(/,/g, '')))
         .filter(n => n > 10 && n < 10000000);
 
-      // First Rs. number = sale price
-      const price: number | null = rsNumbers.length > 0 ? rsNumbers[0] : null;
-
-      // Original price: ONLY set when there is a real discount/strikethrough
       // Check 1: explicit <del> or strikethrough CSS class
       let originalPrice: number | null = null;
       const delEl =
+        document.querySelector('.pdp-price_type_deleted') ||
         document.querySelector('[class*="pdp-price_type_deleted"]') ||
         document.querySelector('[class*="price-del"]') ||
         document.querySelector('[class*="price-original"]') ||
@@ -114,17 +111,40 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         document.querySelector('s');
 
       if (delEl) {
-        const n = parseFloat((delEl.textContent || '').replace(/Rs\.?\s*/i, '').replace(/,/g, '').replace(/[^0-9.]/g, ''));
+        const text = delEl.textContent || '';
+        const n = parseFloat(text.replace(/Rs\.?\s*/i, '').replace(/,/g, '').replace(/[^0-9.]/g, ''));
         if (n > 0) originalPrice = n;
       }
 
-      // Check 2: if no del element, look for "-N%" discount pattern in page text
-      // e.g. "Rs. 478\nRs. 649-26%" means there IS a discount
+      // Check 2: if no del element, look for "-N%" discount pattern or a price that is obviously large
       if (!originalPrice) {
         const discountMatch = allText.match(/Rs\.?\s*[\d,]+-\d+%/i);
         if (discountMatch && rsNumbers.length >= 2) {
-          originalPrice = rsNumbers[1];
+          originalPrice = Math.max(rsNumbers[0], rsNumbers[1]);
         }
+      }
+
+      // ── Sale Price — REFINED ──────────────────────────────────────────────
+      const salePriceEl =
+        document.querySelector('.pdp-price_type_normal') ||
+        document.querySelector('[class*="pdp-product-price"]') ||
+        document.querySelector('.pdp-mod-product-price .pdp-price');
+
+      let price: number | null = null;
+      if (salePriceEl) {
+        const text = salePriceEl.textContent || '';
+        const n = parseFloat(text.replace(/Rs\.?\s*/i, '').replace(/,/g, '').replace(/[^0-9.]/g, ''));
+        if (n > 0) price = n;
+      }
+
+      // Fallback: use first Rs. number if element search failed
+      if (!price && rsNumbers.length > 0) {
+        price = rsNumbers[0];
+      }
+
+      // Ensure originalPrice > price
+      if (originalPrice && price && originalPrice <= price) {
+        originalPrice = null;
       }
       // If neither condition met → product has no discount → originalPrice stays null
 
@@ -150,14 +170,21 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       for (const sel of ratingSelectors) {
         const el = document.querySelector(sel);
         if (el) {
-          const n = parseFloat(el.textContent?.trim() || '0');
+          const text = el.textContent?.trim() || '0';
+          // Split on slash for "4.7 / 5"
+          const cleanText = text.split('/')[0].trim();
+          const n = parseFloat(cleanText);
           if (n > 0 && n <= 5) { rating = n; break; }
         }
       }
-      if (!rating && ratingMatch) rating = parseFloat(ratingMatch[1]);
+
+      if (!rating && ratingMatch) {
+         rating = parseFloat(ratingMatch[1]);
+      }
 
       // ── Review count — UNCHANGED ──────────────────────────────────────────
       const reviewSelectors = [
+        '.pdp-review-summary__link',
         '[class*="rating-count"]',
         '[class*="review-count"]',
         '[class*="total-rating"]',
@@ -167,7 +194,8 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       for (const sel of reviewSelectors) {
         const el = document.querySelector(sel);
         if (el) {
-          const n = parseInt((el.textContent || '').replace(/[^0-9]/g, ''));
+          const text = (el.textContent || '').trim();
+          const n = parseInt(text.replace(/[^0-9]/g, ''));
           if (n > 0) { reviewCount = n; break; }
         }
       }
@@ -178,7 +206,7 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       const ratingsRaw = ratingsMatch1
         ? parseInt(ratingsMatch1[1])
         : ratingsMatch2 ? parseInt(ratingsMatch2[1]) : 0;
-      if (!reviewCount && ratingsRaw > 0 && ratingsRaw <= 10000) reviewCount = ratingsRaw;
+      if (!reviewCount && ratingsRaw > 0 && ratingsRaw <= 100000) reviewCount = ratingsRaw;
 
       // ── Images — UNCHANGED ────────────────────────────────────────────────
       const images: string[] = [];
@@ -228,6 +256,25 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
         const scripts = Array.from(document.querySelectorAll('script'));
         for (const script of scripts) {
           const content = script.textContent || '';
+          
+          // Try __INITIAL_STATE__ (newer Daraz/Lazada/AliExpress format)
+          if (content.includes('__INITIAL_STATE__')) {
+            const m = content.match(/__INITIAL_STATE__\s*=\s*(\{[\s\S]*?\});/m);
+            if (m?.[1]) {
+               const state = JSON.parse(m[1]);
+               const p = state.product || state || {};
+               return {
+                 name:        String(p.name || p.title || ''),
+                 price:       parseFloat(p.price || p.salePrice || '0') || null,
+                 description: String(p.description || p.highlights || '').replace(/<[^>]+>/g, ' ').slice(0, 600),
+                 images:      (p.images || []).map((i: string) => String(i).split('?')[0]).slice(0, 10),
+                 rating:      parseFloat(p.ratingValue || p.rating || '0') || 0,
+                 reviewCount: parseInt(p.reviewCount || '0') || 0,
+               };
+            }
+          }
+
+          // Try __item__ (traditional format)
           if (content.includes('__item__')) {
             const m = content.match(/__item__\s*=\s*(\{[\s\S]*?\});/m);
             if (m?.[1]) {
