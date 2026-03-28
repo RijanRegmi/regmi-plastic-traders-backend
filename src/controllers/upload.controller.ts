@@ -1,30 +1,31 @@
 import { Request, Response, NextFunction } from 'express';
-import cloudinary from '../config/cloudinary';
-import { deleteImageFile } from '../middlewares/upload.middleware';
+import { v2 as cloudinary } from 'cloudinary';
+import { uploadToCloudinary, deleteImageFile } from '../middlewares/upload.middleware';
 import { cmsService } from '../services/cms.service';
 import { blogService } from '../services/blog-review.service';
 import { AppError } from '../errors/AppError';
 import { ICmsSection, IBlogPost } from '../types';
 
-// multer-storage-cloudinary drops the URL on file.path, 
-// and the Cloudinary identifier (e.g. "regmi-plastic/products/abc1234") on file.filename
-type CloudinaryFile = Express.Multer.File & { path: string, filename: string };
-
 export class UploadController {
   // ─── Product images (up to 5) ───────────────────────────────────────────────
   async uploadImages(req: Request, res: Response, next: NextFunction) {
     try {
-      const files = req.files as CloudinaryFile[];
+      const files = req.files as Express.Multer.File[];
       if (!files || files.length === 0) throw new AppError('No files uploaded', 400);
 
-      const uploaded = files.map((file) => ({
-        filename:     file.filename,  // Stores Cloudinary public_id
-        originalName: file.originalname,
-        size:         file.size,
-        mimetype:     file.mimetype,
-        url:          file.path,      // Cloudinary secure URL
-        path:         file.filename,  // Keep path as public_id for DB references and deletions
-      }));
+      const uploaded = await Promise.all(
+        files.map(async (file) => {
+          const result = await uploadToCloudinary(file.buffer, 'products');
+          return {
+            filename:     result.public_id,
+            originalName: file.originalname,
+            size:         file.size,
+            mimetype:     file.mimetype,
+            url:          result.secure_url,
+            path:         result.public_id,
+          };
+        }),
+      );
 
       res.status(201).json({
         success: true,
@@ -37,19 +38,21 @@ export class UploadController {
   // ─── Single product image ────────────────────────────────────────────────────
   async uploadSingle(req: Request, res: Response, next: NextFunction) {
     try {
-      const file = req.file as CloudinaryFile;
+      const file = req.file as Express.Multer.File;
       if (!file) throw new AppError('No file uploaded', 400);
+
+      const result = await uploadToCloudinary(file.buffer, 'products');
 
       res.status(201).json({
         success: true,
         message: 'File uploaded successfully',
         data: {
-          filename:     file.filename,
+          filename:     result.public_id,
           originalName: file.originalname,
           size:         file.size,
           mimetype:     file.mimetype,
-          url:          file.path,
-          path:         file.filename,
+          url:          result.secure_url,
+          path:         result.public_id,
         },
       });
     } catch (err) { next(err); }
@@ -58,19 +61,20 @@ export class UploadController {
   // ─── Blog cover image (attached to an existing post) ────────────────────────
   async uploadBlogImage(req: Request, res: Response, next: NextFunction) {
     try {
-      const file = req.file as CloudinaryFile;
+      const file = req.file as Express.Multer.File;
       if (!file) throw new AppError('No file uploaded', 400);
 
+      const result = await uploadToCloudinary(file.buffer, 'blog');
       const { id } = req.params;
-      const updatedPost = await blogService.update(id, { coverImage: file.path } as Partial<IBlogPost>);
+      const updatedPost = await blogService.update(id, { coverImage: result.secure_url } as Partial<IBlogPost>);
 
       res.status(201).json({
         success: true,
         message: 'Blog cover image uploaded and saved',
         data: {
-          filename: file.filename,
-          url:      file.path,
-          path:     file.filename,
+          filename: result.public_id,
+          url:      result.secure_url,
+          path:     result.public_id,
           post:     updatedPost,
         },
       });
@@ -80,16 +84,18 @@ export class UploadController {
   // ─── Blog cover image (temp — no post ID yet) ────────────────────────────────
   async uploadBlogImageTemp(req: Request, res: Response, next: NextFunction) {
     try {
-      const file = req.file as CloudinaryFile;
+      const file = req.file as Express.Multer.File;
       if (!file) throw new AppError('No file uploaded', 400);
+
+      const result = await uploadToCloudinary(file.buffer, 'blog');
 
       res.status(201).json({
         success: true,
         message: 'Blog cover image uploaded',
         data: {
-          filename: file.filename,
-          url:      file.path,
-          path:     file.filename,
+          filename: result.public_id,
+          url:      result.secure_url,
+          path:     result.public_id,
         },
       });
     } catch (err) { next(err); }
@@ -98,19 +104,21 @@ export class UploadController {
   // ─── Logo ────────────────────────────────────────────────────────────────────
   async uploadLogo(req: Request, res: Response, next: NextFunction) {
     try {
-      const file = req.file as CloudinaryFile;
+      const file = req.file as Express.Multer.File;
       if (!file) throw new AppError('No file uploaded', 400);
 
+      const result = await uploadToCloudinary(file.buffer, 'logo');
+
       // Persist the Cloudinary public URL so it's globally available
-      await cmsService.upsertSection('global', 'logoUrl', file.path, 'Logo Image URL', 'image');
+      await cmsService.upsertSection('global', 'logoUrl', result.secure_url, 'Logo Image URL', 'image');
 
       res.status(201).json({
         success: true,
         message: 'Logo uploaded and saved',
         data: {
-          filename: file.filename,
-          url:      file.path,
-          path:     file.filename,
+          filename: result.public_id,
+          url:      result.secure_url,
+          path:     result.public_id,
         },
       });
     } catch (err) { next(err); }
@@ -119,16 +127,19 @@ export class UploadController {
   // ─── Dynamic background ──────────────────────────────────────────────────────
   async uploadBackground(req: Request, res: Response, next: NextFunction) {
     try {
-      const file = req.file as CloudinaryFile;
+      const file = req.file as Express.Multer.File;
       if (!file) throw new AppError('No file uploaded', 400);
 
-      const page = req.params.page || 'home';
-      const key  = page === 'about' ? 'aboutBgImage' : page === 'blog' ? 'blogBgImage' : 'heroBgImage';
+      const page   = req.params.page || 'home';
+      const folder = page === 'about' ? 'about' : page === 'blog' ? 'blog' : 'background';
+      const key    = page === 'about' ? 'aboutBgImage' : page === 'blog' ? 'blogBgImage' : 'heroBgImage';
+
+      const result = await uploadToCloudinary(file.buffer, folder);
 
       await cmsService.upsertSection(
         page as ICmsSection['page'],
         key,
-        file.path,
+        result.secure_url,
         `${page} Background Image`,
         'image',
       );
@@ -137,9 +148,9 @@ export class UploadController {
         success: true,
         message: 'Background image uploaded and saved',
         data: {
-          filename: file.filename,
-          url:      file.path,
-          path:     file.filename,
+          filename: result.public_id,
+          url:      result.secure_url,
+          path:     result.public_id,
         },
       });
     } catch (err) { next(err); }
@@ -148,16 +159,8 @@ export class UploadController {
   // ─── Delete image ────────────────────────────────────────────────────────────
   async deleteImage(req: Request, res: Response, next: NextFunction) {
     try {
-      // For Cloudinary, :filename passed from frontend should ideally be the `public_id` 
-      // (e.g. "regmi-plastic/products/filename"). Note slashes might be an issue in URL params.
-      // Make sure the frontend encodes the public_id.
       let public_id = req.params.filename;
-
-      // Handle query param `?id=public_id` as a fallback if slashes block standard req.params
-      if (req.query.id) {
-         public_id = req.query.id as string;
-      }
-      
+      if (req.query.id) public_id = req.query.id as string;
       if (!public_id) throw new AppError('Invalid public_id', 400);
 
       await deleteImageFile(public_id);
@@ -168,27 +171,28 @@ export class UploadController {
   // ─── List images ─────────────────────────────────────────────────────────────
   async listImages(_req: Request, res: Response, next: NextFunction) {
     try {
-        // Query Cloudinary Media Library for assets inside our specific folder prefix
-        const result = await cloudinary.api.resources({
-            type: 'upload',
-            prefix: 'regmi-plastic/products/', 
-            max_results: 100 
-        });
+      const result = await cloudinary.api.resources({
+        type: 'upload',
+        prefix: 'regmi-plastic/products/',
+        max_results: 100,
+      });
 
-        const files = result.resources.map((obj: { public_id: string; secure_url: string; bytes: number; created_at: string }) => ({
+      const files = result.resources
+        .map((obj: { public_id: string; secure_url: string; bytes: number; created_at: string }) => ({
           filename:   obj.public_id,
           url:        obj.secure_url,
-          path:       obj.public_id, // Serves as the deletion key
+          path:       obj.public_id,
           size:       obj.bytes,
           uploadedAt: obj.created_at,
         }))
-        // Ensure reverse chronological
-        .sort((a: { uploadedAt: string }, b: { uploadedAt: string }) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+        .sort((a: { uploadedAt: string }, b: { uploadedAt: string }) =>
+          new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime(),
+        );
 
       res.json({ success: true, data: files, total: files.length });
-    } catch (err) { 
-        console.error("Cloudinary List Error", err);
-        next(err); 
+    } catch (err) {
+      console.error('Cloudinary List Error', err);
+      next(err);
     }
   }
 }

@@ -33,8 +33,18 @@ export const errorHandler = (
     return;
   }
 
-  console.error('Unhandled Error:', err);
-  res.status(500).json({ success: false, message: 'Internal server error' });
+  console.error('--- Backend Error Handler ---');
+  console.error('Name:', err.name);
+  console.error('Message:', err.message);
+  const cloudinaryErr = err as Error & { http_code?: number };
+  if (cloudinaryErr.http_code) console.error('Cloudinary Code:', cloudinaryErr.http_code);
+  console.error('Stack:', err.stack);
+  
+  res.status(500).json({ 
+    success: false, 
+    message: err.message || 'Internal server error',
+    error: process.env.NODE_ENV !== 'production' ? err : undefined 
+  });
 };
 
 export const notFound = (_req: Request, res: Response): void => {

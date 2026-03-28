@@ -1,3 +1,4 @@
+// backend/src/routes/index.ts (or wherever your router is)
 import { Router } from 'express';
 import { authController }                          from '../controllers/auth.controller';
 import { productController }                       from '../controllers/product.controller';
@@ -9,8 +10,6 @@ import { messageController }                       from '../controllers/message.
 import { userController }                          from '../controllers/user.controller';
 import { protect, adminOnly }                      from '../middlewares/auth.middleware';
 import { upload, blogImageUpload, logoUpload, dynamicBgUpload } from '../middlewares/upload.middleware';
-
-// ... other code (I will just replace the specific lines actually)
 
 const router = Router();
 
@@ -71,30 +70,33 @@ router.put   ('/admin/messages/:id', (req, res, next) => messageController.updat
 router.delete('/admin/messages/:id', (req, res, next) => messageController.deleteMessage(req, res, next));
 
 // Admin Users
-router.get   ('/admin/users',                    (req, res, next) => userController.getAll(req, res, next));
-router.post  ('/admin/users',     adminOnly,     (req, res, next) => userController.create(req, res, next));
-router.patch ('/admin/users/:id', adminOnly,     (req, res, next) => userController.update(req, res, next));
-router.delete('/admin/users/:id', adminOnly,     (req, res, next) => userController.delete(req, res, next));
+router.get   ('/admin/users',                (req, res, next) => userController.getAll(req, res, next));
+router.post  ('/admin/users',     adminOnly, (req, res, next) => userController.create(req, res, next));
+router.patch ('/admin/users/:id', adminOnly, (req, res, next) => userController.update(req, res, next));
+router.delete('/admin/users/:id', adminOnly, (req, res, next) => userController.delete(req, res, next));
 
-// Admin Image Uploads
-router.get   ('/admin/upload',          (req, res, next) => uploadController.listImages(req, res, next));
-router.post  ('/admin/upload',           upload.array('images', 5), (req, res, next) => uploadController.uploadImages(req, res, next));
-router.post  ('/admin/upload/single',    upload.single('image'),    (req, res, next) => uploadController.uploadSingle(req, res, next));
-router.delete('/admin/upload/:filename', (req, res, next) => uploadController.deleteImage(req, res, next));
+// ─── Admin Image Uploads ───────────────────────────────────────────────────────
+// ⚠️ IMPORTANT: Specific routes MUST come before wildcard (:filename) routes
 
-// Admin Logo Upload
+// Logo — must be before /admin/upload/:filename
 router.post('/admin/upload/logo', logoUpload.single('logo'), (req, res, next) => uploadController.uploadLogo(req, res, next));
 
-// Admin Hero Background Upload
-// Must be declared BEFORE /blog-temp and /blog/:id so Express doesn't conflict
+// Background — must be before /admin/upload/:filename
 router.post('/admin/upload/background/:page', dynamicBgUpload.single('background'), (req, res, next) => uploadController.uploadBackground(req, res, next));
 
-// Admin Blog Image Upload
-// NOTE: /blog-temp must come BEFORE /blog/:id
+// Blog images — /blog-temp must be before /blog/:id
 router.post('/admin/upload/blog-temp', blogImageUpload.single('coverImage'), (req, res, next) => uploadController.uploadBlogImageTemp(req, res, next));
 router.post('/admin/upload/blog/:id',  blogImageUpload.single('coverImage'), (req, res, next) => uploadController.uploadBlogImage(req, res, next));
 
-// ─── Admin Daraz Scraper ← NEW ────────────────────────────────────────────────
+// Generic upload — must come AFTER all specific routes above
+router.get   ('/admin/upload',           (req, res, next) => uploadController.listImages(req, res, next));
+router.post  ('/admin/upload',            upload.array('images', 5), (req, res, next) => uploadController.uploadImages(req, res, next));
+router.post  ('/admin/upload/single',     upload.single('image'),    (req, res, next) => uploadController.uploadSingle(req, res, next));
+
+// Wildcard delete — must be LAST
+router.delete('/admin/upload/:filename', (req, res, next) => uploadController.deleteImage(req, res, next));
+
+// ─── Admin Daraz Scraper ───────────────────────────────────────────────────────
 router.post('/admin/scrape/daraz', (req, res, next) => scraperController.fetchDarazProduct(req, res, next));
 
 export default router;

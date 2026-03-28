@@ -1,6 +1,11 @@
+// ─── MUST be first — loads .env before any other module reads process.env ──────
 import 'dotenv/config';
-import express, { Request, Response, NextFunction } from 'express';
 
+// ─── Configure Cloudinary immediately after dotenv ────────────────────────────
+import { configureCloudinary } from './config/cloudinary';
+configureCloudinary();
+
+import express, { Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
@@ -11,8 +16,7 @@ import { errorHandler, notFound } from './middlewares/error.middleware';
 
 const app = express();
 
-// ─── CORS — manually set headers to handle preflight ──────────────────────────
-// ✅ Fix: dynamically allow requesting origin to support Vercel preview deployments
+// ─── CORS & Logging ───────────────────────────────────────────────────────────
 app.use((req: Request, res: Response, next: NextFunction) => {
   const allowedOrigin = req.headers.origin || process.env.CLIENT_URL || 'http://localhost:3000';
   res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
@@ -20,7 +24,10 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,PATCH,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
 
-  // Respond immediately to preflight
+  if (req.method !== 'OPTIONS') {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  }
+
   if (req.method === 'OPTIONS') {
     res.sendStatus(204);
     return;
@@ -32,9 +39,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
-
-// Static file serving via Cloudinary. Local /uploads directory is no longer utilized 
-// for media payloads in this Vercel deployment structure.
 
 // ─── Logging ───────────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'production') app.use(morgan('dev'));
@@ -56,12 +60,10 @@ app.use(errorHandler);
 const PORT = process.env.PORT || 5050;
 
 if (process.env.NODE_ENV !== 'production') {
-  // Only start the server locally. Vercel will import the `app` instance and bind to the request.
   connectDB().then(() => {
     app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
   });
 } else {
-  // Ensure DB connects in lambda though
   connectDB().catch(console.error);
 }
 
