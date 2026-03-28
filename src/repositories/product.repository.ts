@@ -1,13 +1,13 @@
-import { FilterQuery, UpdateQuery } from 'mongoose';
+import { QueryFilter, UpdateQuery, SortOrder } from 'mongoose';
 import { Product } from '../models/Product.model';
 import { IProduct } from '../types';
 
 export class ProductRepository {
   async findAll(
-    filter: FilterQuery<IProduct> = {},
-    options: { page?: number; limit?: number; sort?: object } = {}
+    filter: QueryFilter<IProduct> = {},
+    options: { page?: number; limit?: number; sort?: string | Record<string, SortOrder> } = {}
   ) {
-    const { page = 1, limit = 20, sort = { createdAt: -1 } } = options;
+    const { page = 1, limit = 20, sort = { createdAt: -1 } as Record<string, SortOrder> } = options;
     const skip = (page - 1) * limit;
 
     const [data, total] = await Promise.all([

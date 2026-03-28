@@ -4,8 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
-import path from 'path';
-import fs from 'fs';
+
 import { connectDB } from './config/database';
 import routes from './routes';
 import { errorHandler, notFound } from './middlewares/error.middleware';
@@ -34,10 +33,8 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ─── Static: serve uploaded images ────────────────────────────────────────────
-const uploadsDir = path.join(process.cwd(), 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-app.use('/uploads', express.static(uploadsDir));
+// Static file serving via Cloudinary. Local /uploads directory is no longer utilized 
+// for media payloads in this Vercel deployment structure.
 
 // ─── Logging ───────────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== 'production') app.use(morgan('dev'));
@@ -57,8 +54,15 @@ app.use(errorHandler);
 
 // ─── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5050;
-connectDB().then(() => {
-  app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
-});
+
+if (process.env.NODE_ENV !== 'production') {
+  // Only start the server locally. Vercel will import the `app` instance and bind to the request.
+  connectDB().then(() => {
+    app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
+  });
+} else {
+  // Ensure DB connects in lambda though
+  connectDB().catch(console.error);
+}
 
 export default app;

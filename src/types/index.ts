@@ -27,6 +27,7 @@ export interface IProduct extends Document {
   slug: string;
   description: string;
   price: number;
+  originalPrice?: number;          // ← ADDED
   category: string;
   images: string[];
   darazLink: string;

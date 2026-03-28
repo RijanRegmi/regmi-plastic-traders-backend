@@ -31,11 +31,11 @@ const seed = async () => {
   // Admin user
   await User.create({
     name: 'Admin',
-    email: 'admin@regmiplastic.com',
+    email: 'admin@regmiplastic',
     password: 'admin123',
     role: 'admin',
   });
-  console.log('✅ Admin user: admin@regmiplastic.com / admin123');
+  console.log('✅ Admin user: admin@regmiplastic / admin123');
 
   // ✅ Use .save() instead of insertMany so pre-save hook runs and generates slugs
   const products = [

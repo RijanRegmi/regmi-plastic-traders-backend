@@ -40,6 +40,13 @@ export class ProductController {
     } catch (err) { next(err); }
   }
 
+  async getById(req: Request, res: Response, next: NextFunction) {
+    try {
+      const product = await productService.getById(req.params.id);
+      res.json({ success: true, data: product });
+    } catch (err) { next(err); }
+  }
+
   async adminGetAll(req: Request, res: Response, next: NextFunction) {
     try {
       const { page, limit, category, search } = req.query;

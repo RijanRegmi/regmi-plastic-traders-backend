@@ -1,10 +1,10 @@
 import { BlogPost } from '../models/BlogPost.model';
 import { Review } from '../models/Review.model';
 import { IBlogPost, IReview } from '../types';
-import { FilterQuery, UpdateQuery } from 'mongoose';
+import { QueryFilter, UpdateQuery } from 'mongoose';
 
 export class BlogRepository {
-  async findAll(filter: FilterQuery<IBlogPost> = {}, options: { page?: number; limit?: number } = {}) {
+  async findAll(filter: QueryFilter<IBlogPost> = {}, options: { page?: number; limit?: number } = {}) {
     const { page = 1, limit = 10 } = options;
     const skip = (page - 1) * limit;
     const [data, total] = await Promise.all([
