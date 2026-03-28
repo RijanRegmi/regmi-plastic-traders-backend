@@ -49,7 +49,13 @@ app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, max: 500, message: 'Too ma
 // ─── Routes ────────────────────────────────────────────────────────────────────
 app.use('/api', routes);
 
-// ─── Health Check ──────────────────────────────────────────────────────────────
+// ─── Welcome & Health Check ───────────────────────────────────────────────────
+app.get('/', (_req, res) => res.json({ 
+  message: 'Welcome to Regmi Plastic Traders API', 
+  status: 'active',
+  environment: process.env.NODE_ENV || 'development'
+}));
+
 app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date() }));
 
 // ─── Error Handling — MUST be last ────────────────────────────────────────────

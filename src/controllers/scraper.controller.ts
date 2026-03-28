@@ -23,6 +23,7 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
 
   let browser: Browser | null = null;
 
+  console.log(`[Scraper] Initializing... (Mode: ${process.env.VERCEL === '1' ? 'Vercel' : 'Local'})`);
   try {
     const isVercel = process.env.VERCEL === '1' || process.env.NODE_ENV === 'production';
     
@@ -56,9 +57,11 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
     );
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-    const cleanUrl = url.split('?')[0].replace(/\/$/, '') + '.html';
+    const baseUrl = url.split('?')[0].replace(/\/$/, '');
+    const cleanUrl = baseUrl.endsWith('.html') ? baseUrl : `${baseUrl}.html`;
 
-    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
+    console.log(`[Scraper] Navigating to: ${cleanUrl}`);
+    await page.goto(cleanUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
     
     // Give time for JS to start rendering — faster on local, longer on Vercel
     const initialWait = isVercel ? 5000 : 2000;
