@@ -58,10 +58,15 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
 
     const cleanUrl = url.split('?')[0].replace(/\/$/, '') + '.html';
 
-    await page.goto(cleanUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-    await new Promise(r => setTimeout(r, 3000));
-    await page.evaluate(() => window.scrollBy(0, 800));
-    await new Promise(r => setTimeout(r, 1500));
+    await page.goto(cleanUrl, { waitUntil: 'networkidle2', timeout: 35000 });
+    
+    // Give more time on Vercel for JS components to render
+    const extraWait = isVercel ? 6000 : 3000;
+    await new Promise(r => setTimeout(r, extraWait));
+    
+    // Scroll to trigger lazy loading of ratings/prices
+    await page.evaluate(() => window.scrollBy(0, 1000));
+    await new Promise(r => setTimeout(r, 2000));
 
     const result = await page.evaluate((): {
       name: string;
@@ -239,12 +244,31 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
       const description = (descEl?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 600);
 
       // ── Category — UNCHANGED ──────────────────────────────────────────────
+      // ── Category — RE-ADDED ──────────────────────────────────────────────
       const crumbs = Array.from(
         document.querySelectorAll('[class*="breadcrumb"] a, nav a')
       ).map(el => (el as HTMLElement).textContent?.trim() || '');
       const category = crumbs.filter(c => c && c.toLowerCase() !== 'home').pop() || '';
 
-      return { name, price, originalPrice, description, images: images.slice(0, 10), rating, reviewCount, category, rawPrices, rawRatings };
+      // ── Meta Tags (MOST RELIABLE FOR PRICE) ─────────────────────────────
+      const getMeta = (prop: string): string =>
+        document.querySelector(`meta[property="${prop}"]`)?.getAttribute('content') ||
+        document.querySelector(`meta[name="${prop}"]`)?.getAttribute('content') || '';
+
+      const metaPrice = parseFloat(getMeta('og:price:amount') || getMeta('product:price:amount') || '0');
+
+      return { 
+        name, 
+        price: price || (metaPrice > 0 ? metaPrice : null), 
+        originalPrice, 
+        description, 
+        images: images.slice(0, 10), 
+        rating, 
+        reviewCount, 
+        category, 
+        rawPrices, 
+        rawRatings 
+      };
     });
 
     // ── Also try window.__item__ JSON — UNCHANGED ─────────────────────────────
@@ -308,7 +332,8 @@ async function scrapeWithPuppeteer(url: string): Promise<DarazProduct> {
     console.log('[Scraper] originalPrice:', result.originalPrice);
 
     const name        = result.name        || jsonData?.name        || '';
-    const price       = result.price; // DOM only — JSON price unreliable
+    // Priority: DOM/Meta > JSON Fallback
+    const price       = result.price       || jsonData?.price       || null; 
     const description = result.description || jsonData?.description || '';
     const rating      = result.rating      || jsonData?.rating      || 0;
     const reviewCount = result.reviewCount || jsonData?.reviewCount || 0;
