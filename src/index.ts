@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
-import cors from 'cors';
+
 import helmet from 'helmet';
 import morgan from 'morgan';
 import rateLimit from 'express-rate-limit';
@@ -12,10 +12,10 @@ import { errorHandler, notFound } from './middlewares/error.middleware';
 const app = express();
 
 // ─── CORS — manually set headers to handle preflight ──────────────────────────
-// ✅ Fix: manually handle OPTIONS preflight + set headers on every response
+// ✅ Fix: dynamically allow requesting origin to support Vercel preview deployments
 app.use((req: Request, res: Response, next: NextFunction) => {
-  const origin = process.env.CLIENT_URL || 'http://localhost:3000';
-  res.setHeader('Access-Control-Allow-Origin', origin);
+  const allowedOrigin = req.headers.origin || process.env.CLIENT_URL || 'http://localhost:3000';
+  res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,PATCH,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
