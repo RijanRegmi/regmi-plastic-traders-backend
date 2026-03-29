@@ -1,6 +1,7 @@
 import { blogRepository, reviewRepository } from '../repositories/blog-review.repository';
 import { NotFoundError } from '../errors/AppError';
 import { IBlogPost, IReview } from '../types';
+import { deleteByUrl } from '../middlewares/upload.middleware';
 
 export class BlogService {
   async getPublished(page = 1, limit = 10) {
@@ -28,14 +29,28 @@ export class BlogService {
   }
 
   async update(id: string, data: Partial<IBlogPost>) {
+    // ── Get old post for cleanup ─────────────────────────────────────────────
+    const oldPost = await blogRepository.findById(id);
+
     const post = await blogRepository.update(id, data);
     if (!post) throw new NotFoundError('Blog post');
+
+    // ── Clean up old cover image ─────────────────────────────────────────────
+    if (oldPost && data.coverImage && oldPost.coverImage !== data.coverImage) {
+      await deleteByUrl(oldPost.coverImage);
+    }
+
     return post;
   }
 
   async delete(id: string) {
-    const post = await blogRepository.delete(id);
+    const post = await blogRepository.findById(id);
     if (!post) throw new NotFoundError('Blog post');
+
+    // ── Clean up cover image ─────────────────────────────────────────────────
+    if (post.coverImage) await deleteByUrl(post.coverImage);
+
+    await blogRepository.delete(id);
     return { message: 'Post deleted' };
   }
 }

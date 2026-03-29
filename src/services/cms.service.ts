@@ -1,5 +1,6 @@
 import { cmsRepository } from '../repositories/cms.repository';
 import { ICmsSection } from '../types';
+import { deleteByUrl } from '../middlewares/upload.middleware';
 
 export class CmsService {
   async getPageContent(page: ICmsSection['page']) {
@@ -26,6 +27,13 @@ export class CmsService {
     label: string,
     type: ICmsSection['type'] = 'text'
   ) {
+    // ── Clean up old image if type is image ──────────────────────────────────
+    if (type === 'image') {
+      const existing = await cmsRepository.findByKey(page, key);
+      if (existing && existing.value !== value && typeof existing.value === 'string') {
+        await deleteByUrl(existing.value);
+      }
+    }
     return cmsRepository.upsert(page, key, { value, label, type });
   }
 
@@ -37,6 +45,16 @@ export class CmsService {
     page: ICmsSection['page'],
     updates: Record<string, { value: unknown; label?: string; type?: ICmsSection['type'] }>
   ) {
+    // ── Clean up old images for each key ─────────────────────────────────────
+    for (const [key, meta] of Object.entries(updates)) {
+      if (meta.type === 'image') {
+        const existing = await cmsRepository.findByKey(page, key);
+        if (existing && existing.value !== meta.value && typeof existing.value === 'string') {
+          await deleteByUrl(existing.value);
+        }
+      }
+    }
+
     const items = Object.entries(updates).map(([key, meta]) => ({
       page,
       key,

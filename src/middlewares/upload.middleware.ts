@@ -92,6 +92,34 @@ export const deleteImageFile = async (public_id: string): Promise<void> => {
   }
 };
 
+// ─── Delete helper by URL (handles Cloudinary and Legacy) ───────────────────
+export const deleteByUrl = async (url: string): Promise<void> => {
+  if (!url) return;
+  
+  // 1. Handle Cloudinary deletion
+  if (url.includes('cloudinary.com')) {
+    try {
+      const parts = url.split('/upload/');
+      if (parts.length > 1) {
+        const pathSegments = parts[1].split('/');
+        // Skip the "vXXXX" (version) segment if present
+        const startIndex = pathSegments[0].startsWith('v') ? 1 : 0;
+        const pathWithExtension = pathSegments.slice(startIndex).join('/');
+        // Strip file extension
+        const public_id = pathWithExtension.substring(0, pathWithExtension.lastIndexOf('.'));
+        if (public_id) await deleteImageFile(public_id);
+      }
+    } catch (err) {
+      console.warn('Failed to delete image from Cloudinary via URL:', err);
+    }
+  }
+  // 2. Handle legacy local deletion (if needed)
+  else if (url.includes('/uploads/')) {
+    const filename = url.split('/uploads/')[1];
+    if (filename) await deleteImageFile(filename);
+  }
+};
+
 // ─── Legacy URL helpers (kept for compatibility) ───────────────────────────────
 export const getImageUrl          = (_req: Request, url: string) => url;
 export const getBlogImageUrl      = (_req: Request, url: string) => url;

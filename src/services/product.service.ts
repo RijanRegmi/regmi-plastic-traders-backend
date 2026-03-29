@@ -1,6 +1,7 @@
 import { productRepository } from '../repositories/product.repository';
 import { NotFoundError } from '../errors/AppError';
 import { IProduct } from '../types';
+import { deleteByUrl } from '../middlewares/upload.middleware';
 
 export class ProductService {
   async getAll(query: {
@@ -53,14 +54,35 @@ export class ProductService {
   }
 
   async update(id: string, data: Partial<IProduct>) {
+    // ── Get old product for cleanup ──────────────────────────────────────────
+    const oldProduct = await productRepository.findById(id);
+    
     const product = await productRepository.update(id, data);
     if (!product) throw new NotFoundError('Product');
+
+    // ── Clean up removed images ──────────────────────────────────────────────
+    if (oldProduct && data.images) {
+      const removed = oldProduct.images.filter((img) => !data.images?.includes(img));
+      for (const imgUrl of removed) {
+        await deleteByUrl(imgUrl);
+      }
+    }
+
     return product;
   }
 
   async delete(id: string) {
-    const product = await productRepository.delete(id);
+    const product = await productRepository.findById(id);
     if (!product) throw new NotFoundError('Product');
+
+    // ── Clean up all images ─────────────────────────────────────────────────
+    if (product.images?.length > 0) {
+      for (const imgUrl of product.images) {
+        await deleteByUrl(imgUrl);
+      }
+    }
+
+    await productRepository.delete(id);
     return { message: 'Product deleted successfully' };
   }
 }
