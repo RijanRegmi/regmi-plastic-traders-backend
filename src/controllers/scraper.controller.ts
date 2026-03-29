@@ -153,9 +153,9 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
   return out;
 }
 
-/* ─────────── Step 2: Puppeteer — wait for JS-rendered price and rating ─────────── */
+/* ─────────── Step 2: Puppeteer — get JS-rendered price & rating ─────────── */
 
-async function fetchDynamicData(url: string): Promise<{
+async function fetchDynamicDataRaw(url: string): Promise<{
   price: number | null;
   originalPrice: number | null;
   rating: number;
@@ -173,6 +173,7 @@ async function fetchDynamicData(url: string): Promise<{
         '--no-sandbox', '--disable-setuid-sandbox',
         '--disable-dev-shm-usage', '--disable-gpu',
         '--single-process', '--no-zygote',
+        '--disable-extensions', '--disable-background-timer-throttling',
       ],
       defaultViewport: { width: 1280, height: 800 },
       executablePath: isVercel
@@ -190,33 +191,23 @@ async function fetchDynamicData(url: string): Promise<{
       reviewCount: 0,
     };
 
-    // Block images/fonts/css to speed up — keep scripts and XHR (needed for price API calls)
+    // Block EVERYTHING except scripts and XHR/fetch
+    // We already have images from axios — blocking all images speeds up significantly
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const rt = req.resourceType();
-      if (['stylesheet', 'font', 'media'].includes(rt)) {
+      if (['image', 'stylesheet', 'font', 'media', 'other'].includes(rt)) {
         req.abort();
-      } else if (rt === 'image') {
-        // Allow only tiny images (thumbnails) to avoid blocking gallery detection
-        const u = req.url();
-        if (u.includes('placeholder') || u.includes('logo') || (!u.includes('daraz') && !u.includes('lazada'))) {
-          req.abort();
-        } else {
-          req.continue();
-        }
       } else {
         req.continue();
       }
     });
 
-    // Intercept API responses that contain price/rating data
+    // Intercept API responses for price/rating
     page.on('response', async (response: HTTPResponse) => {
       const u = response.url();
-      if (
-        u.includes('mtop') || u.includes('getPrice') ||
-        u.includes('itemDetail') || u.includes('pdp') ||
-        u.includes('product/detail') || u.includes('lazada')
-      ) {
+      if (u.includes('mtop') || u.includes('getPrice') || u.includes('itemDetail') ||
+          u.includes('pdp') || u.includes('product/detail') || u.includes('lazada')) {
         try {
           const ct = response.headers()['content-type'] ?? '';
           if (!ct.includes('json')) return;
@@ -225,25 +216,15 @@ async function fetchDynamicData(url: string): Promise<{
 
           if (raw.includes('salePrice') || raw.includes('sale_price') || raw.includes('"price"')) {
             const pM = raw.match(/"(?:salePrice|sale_price|discountedPrice|currentPrice)"\s*:\s*([\d.]+)/);
-            if (pM) {
-              const p = parseNPR(pM[1]);
-              if (p !== null) { capturedData.price = p; console.log(`[intercept] price=${p}`); }
-            }
+            if (pM) { const p = parseNPR(pM[1]); if (p !== null) capturedData.price = p; }
             const oM = raw.match(/"(?:originalPrice|original_price|retailPrice)"\s*:\s*([\d.]+)/);
-            if (oM) {
-              const op = parseNPR(oM[1]);
-              if (op !== null) { capturedData.originalPrice = op; }
-            }
+            if (oM) { const op = parseNPR(oM[1]); if (op !== null) capturedData.originalPrice = op; }
           }
-
           if (raw.includes('rating') || raw.includes('Rating') || raw.includes('score')) {
             const rM = raw.match(/"(?:ratingScore|averageScore|average|ratingValue)"\s*:\s*([\d.]+)/);
-            if (rM) {
-              const r = parseFloat(rM[1]);
-              if (r > 0 && r <= 5) { capturedData.rating = r; console.log(`[intercept] rating=${r}`); }
-            }
+            if (rM) { const r = parseFloat(rM[1]); if (r > 0 && r <= 5) capturedData.rating = r; }
             const cM = raw.match(/"(?:reviewCount|review_count|ratingCount|totalReview)"\s*:\s*(\d+)/);
-            if (cM) { capturedData.reviewCount = parseInt(cM[1]); }
+            if (cM) capturedData.reviewCount = parseInt(cM[1]);
           }
         } catch { /* skip non-JSON */ }
       }
@@ -254,70 +235,84 @@ async function fetchDynamicData(url: string): Promise<{
     const cleanUrl = url.split('?')[0].replace(/\/$/, '');
     const finalUrl = cleanUrl.endsWith('.html') ? cleanUrl : `${cleanUrl}.html`;
 
-    // domcontentloaded (not networkidle0!) — Daraz has infinite tracking pings
-    // that would make networkidle0 never resolve on Vercel
-    await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // Wait for THE sale price element — confirmed selector from actual Daraz HTML inspection
-    // This element is added by React AFTER the JS price API call completes (~5-10s)
+    // Wait up to 10s for EITHER price element OR review link to update (signal JS ran)
+    // — much faster than waiting 22s for a single selector that may never appear on Vercel
     try {
-      await page.waitForSelector('.pdp-price_type_normal', { timeout: 22000 });
-      console.log('[puppeteer] .pdp-price_type_normal found');
+      await page.waitForFunction(() => {
+        // Price has rendered
+        const priceEls = document.querySelectorAll('[class*="pdp-price_type_normal"]');
+        for (let i = 0; i < priceEls.length; i++) {
+          const n = parseFloat(((priceEls[i] as HTMLElement).innerText ?? '').replace(/[^\d.]/g, ''));
+          if (n > 100) return true;
+        }
+        // OR rating has rendered
+        const scoreEl = document.querySelector('[class*="score-average"]') as HTMLElement | null;
+        if (scoreEl?.innerText && parseFloat(scoreEl.innerText) > 0) return true;
+        // OR review link changed from "No Ratings" to actual count
+        const rLink = document.querySelector('.pdp-review-summary__link') as HTMLElement | null;
+        if (rLink?.innerText && !rLink.innerText.toLowerCase().startsWith('no')) return true;
+        return false;
+      }, { timeout: 10000, polling: 500 });
+      console.log('[puppeteer] JS data rendered');
     } catch {
-      console.log('[puppeteer] price selector timed out — extracting whatever is available');
+      console.log('[puppeteer] 10s wait elapsed — extracting whatever rendered');
     }
-
-    // Brief wait for rating to render (loads just after price)
-    await new Promise(r => setTimeout(r, 1000));
 
     const domData = await page.evaluate(() => {
       const getNum = (s: string) => parseFloat(s.replace(/[^\d.]/g, '')) || 0;
-      const getText = (sel: string) => (document.querySelector(sel) as HTMLElement)?.innerText?.trim() ?? '';
 
-      // Sale price
+      // Sale price — try partial class match for resilience
       let price: number | null = null;
-      for (const sel of ['.pdp-price_type_normal', '.pdp-mod-product-badge-price .pdp-price']) {
-        const els = document.querySelectorAll(sel);
-        for (let i = 0; i < els.length; i++) {
-          const n = getNum((els[i] as HTMLElement).innerText ?? '');
-          if (n > 100) { price = n; break; }
-        }
-        if (price !== null) break;
+      const priceEls = document.querySelectorAll('[class*="pdp-price_type_normal"]');
+      for (let i = 0; i < priceEls.length; i++) {
+        const n = getNum((priceEls[i] as HTMLElement).innerText ?? '');
+        if (n > 100) { price = n; break; }
       }
 
       // Original/crossed price
       let originalPrice: number | null = null;
-      const origTxt = getText('.pdp-price_type_deleted');
-      if (origTxt) { const n = getNum(origTxt); if (n > 100) originalPrice = n; }
+      const origEls = document.querySelectorAll('[class*="pdp-price_type_deleted"]');
+      for (let i = 0; i < origEls.length; i++) {
+        const n = getNum((origEls[i] as HTMLElement).innerText ?? '');
+        if (n > 100) { originalPrice = n; break; }
+      }
 
-      // Rating: .score-average renders "4.7" after JS load
+      // Rating — try multiple selectors, also try aria-label on star elements
       let rating = 0;
-      const scoreEl = document.querySelector('.score-average') as HTMLElement | null;
+      const scoreEl = document.querySelector('[class*="score-average"]') as HTMLElement | null;
       if (scoreEl?.innerText) {
         const r = parseFloat(scoreEl.innerText.trim());
         if (r > 0 && r <= 5) rating = r;
       }
+      // Fallback: stars bar has width style indicating score (e.g. width:94% → ~4.7)
+      if (!rating) {
+        const starBar = document.querySelector('[class*="pdp-review-summary__stars"] [class*="content-star"]') as HTMLElement | null;
+        if (starBar?.style?.width) {
+          const pct = parseFloat(starBar.style.width);
+          if (pct > 0) rating = Math.round((pct / 100) * 5 * 10) / 10;
+        }
+      }
 
-      // Review count: .pdp-review-summary__link renders "Ratings 20" after JS
-      // (starts as "No Ratings" in initial HTML — ignore that)
+      // Review count — .pdp-review-summary__link shows "Ratings 20" after JS
       let reviewCount = 0;
-      const linkEl = document.querySelector('.pdp-review-summary__link') as HTMLElement | null;
-      if (linkEl?.innerText) {
-        const txt = linkEl.innerText.trim();
+      const rLink = document.querySelector('.pdp-review-summary__link') as HTMLElement | null;
+      if (rLink?.innerText) {
+        const txt = rLink.innerText.trim();
         if (txt && !txt.toLowerCase().startsWith('no')) {
           const m = txt.match(/(\d+)/);
           if (m) reviewCount = parseInt(m[1]);
         }
       }
 
-      // Gallery images
+      // Images from DOM (fallback if axios missed any)
       const imgs: string[] = [];
       for (const sel of ['.item-gallery__thumbnail img', '.pdp-mod-common-image img', '[class*="gallery"] img']) {
         document.querySelectorAll(sel).forEach((el) => {
           const img = el as HTMLImageElement;
           const src = img.src || img.dataset?.src || img.getAttribute('data-lazyload') || '';
           if (src && src.startsWith('http') && !src.includes('data:') && !src.includes('placeholder')) {
-            // Strip any thumbnail suffix (e.g. _100x100.jpg or _960x960.jpg) → original quality
             const hq = src.replace(/_\d+x\d+(?=\.(jpg|jpeg|png|webp))/i, '').split('?')[0];
             if (!imgs.includes(hq)) imgs.push(hq);
           }
@@ -328,7 +323,7 @@ async function fetchDynamicData(url: string): Promise<{
       return { price, originalPrice, rating, reviewCount, images: imgs.slice(0, 8) };
     });
 
-    console.log(`[puppeteer DOM] price=${domData.price} origPrice=${domData.originalPrice} rating=${domData.rating} reviews=${domData.reviewCount} imgs=${domData.images.length}`);
+    console.log(`[puppeteer] price=${domData.price} origPrice=${domData.originalPrice} rating=${domData.rating} reviews=${domData.reviewCount} imgs=${domData.images.length}`);
 
     return {
       price: capturedData.price ?? domData.price,
@@ -346,6 +341,29 @@ async function fetchDynamicData(url: string): Promise<{
   }
 }
 
+// Hard 15s cap on the entire Puppeteer operation
+// Prevents Vercel from hanging when Daraz is slow or blocks the IP
+async function fetchDynamicData(url: string): Promise<{
+  price: number | null;
+  originalPrice: number | null;
+  rating: number;
+  reviewCount: number;
+  images: string[];
+}> {
+  const fallback = { price: null, originalPrice: null, rating: 0, reviewCount: 0, images: [] };
+  const PUPPETEER_TIMEOUT_MS = 20000; // 20s max total (including Chromium launch)
+
+  const result = await Promise.race([
+    fetchDynamicDataRaw(url),
+    new Promise<typeof fallback>((resolve) =>
+      setTimeout(() => { console.log('[puppeteer] Hard 20s cap hit — returning fallback'); resolve(fallback); },
+        PUPPETEER_TIMEOUT_MS)
+    ),
+  ]);
+
+  return result;
+}
+
 /* ─────────── Main ─────────── */
 
 async function scrape(url: string): Promise<DarazProduct> {
@@ -354,7 +372,8 @@ async function scrape(url: string): Promise<DarazProduct> {
     images: [], rating: 0, reviewCount: 0, category: '', success: false,
   };
 
-  // Run axios (fast, static data) and puppeteer (dynamic: price, rating) in parallel
+  // Both run in parallel: axios gets static data (name, desc, images) in ~3s,
+  // Puppeteer gets dynamic data (price, rating) in ~10-20s
   const [staticData, dynamicData] = await Promise.allSettled([
     fetchStaticData(url),
     fetchDynamicData(url),
@@ -365,13 +384,13 @@ async function scrape(url: string): Promise<DarazProduct> {
     price: null, originalPrice: null, rating: 0, reviewCount: 0, images: []
   };
 
-  if (staticData.status === 'rejected') console.log('[scrape] axios failed:', staticData.reason);
-  if (dynamicData.status === 'rejected') console.log('[scrape] puppeteer failed:', dynamicData.reason);
+  if (staticData.status === 'rejected') console.log('[scrape] axios failed:', (staticData.reason as Error).message);
+  if (dynamicData.status === 'rejected') console.log('[scrape] puppeteer failed:', (dynamicData.reason as Error).message);
 
   const result: DarazProduct = {
     name: sd.name ?? '',
-    price: dd.price,                               // from puppeteer (JS-rendered)
-    originalPrice: dd.originalPrice ?? sd.originalPrice ?? null, // puppeteer first, axios pdt_price fallback
+    price: dd.price,
+    originalPrice: dd.originalPrice ?? sd.originalPrice ?? null,
     description: sd.description ?? '',
     images: (dd.images.length > 0 ? dd.images : sd.images) ?? [],
     rating: dd.rating,
@@ -389,6 +408,8 @@ async function scrape(url: string): Promise<DarazProduct> {
   result.success = true;
   return result;
 }
+
+
 
 /* ─────────── Controller ─────────── */
 
