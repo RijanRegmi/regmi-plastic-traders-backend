@@ -136,8 +136,10 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
               const src = typeof img === 'string' ? img
                 : (img as Record<string, unknown>).url as string
                   ?? (img as Record<string, unknown>).src as string;
-              if (typeof src === 'string' && src.startsWith('http') && !allImgs.includes(src)) {
-                allImgs.push(src.replace(/_\d+x\d+\.(jpg|jpeg|png|webp)/i, '_800x800.$1').split('?')[0]);
+              if (typeof src === 'string' && src.startsWith('http')) {
+                // Strip thumbnail size suffix to get original quality (e.g. _100x100.jpg → .jpg)
+                const hq = src.replace(/_\d+x\d+(?=\.(jpg|jpeg|png|webp))/i, '').split('?')[0];
+                if (!allImgs.includes(hq)) allImgs.push(hq);
               }
             }
           }
@@ -315,7 +317,8 @@ async function fetchDynamicData(url: string): Promise<{
           const img = el as HTMLImageElement;
           const src = img.src || img.dataset?.src || img.getAttribute('data-lazyload') || '';
           if (src && src.startsWith('http') && !src.includes('data:') && !src.includes('placeholder')) {
-            const hq = src.replace(/_\d+x\d+\.(jpg|jpeg|png|webp)/i, '_800x800.$1').split('?')[0];
+            // Strip any thumbnail suffix (e.g. _100x100.jpg or _960x960.jpg) → original quality
+            const hq = src.replace(/_\d+x\d+(?=\.(jpg|jpeg|png|webp))/i, '').split('?')[0];
             if (!imgs.includes(hq)) imgs.push(hq);
           }
         });
