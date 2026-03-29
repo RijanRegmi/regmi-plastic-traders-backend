@@ -46,7 +46,32 @@ function stripHtml(raw: string): string {
 }
 
 
-/* ─────────── Step 1: axios for static data (name, desc, images) ─────────── */
+
+/**
+ * Convert any Daraz/Lazada CDN image URL to the highest quality version (960x960).
+ * Daraz CDN always generates _960x960q80 for all product images.
+ * Formats seen:
+ *   static-01.daraz.com.np/p/{hash}.png           → no suffix  (raw upload, may be tiny)
+ *   static-01.daraz.com.np/p/{hash}_100x100.png    → thumbnail
+ *   img.drz.lazcdn.com/static/np/p/{hash}.png_960x960q80.png_.webp → HQ
+ * We normalise ALL to the static host _960x960q80 form.
+ */
+function toDarazHQ(src: string): string {
+  if (!src || !src.startsWith('http')) return src;
+  // Strip query string
+  let u = src.split('?')[0];
+  // Strip trailing _.webp CDN wrapper if present
+  u = u.replace(/\.webp$/i, '');
+  // Strip any existing size+quality suffix like _100x100q80 or _960x960
+  u = u.replace(/_\d+x\d+(?:q\d+)?(?=\.(jpg|jpeg|png|webp))/i, '');
+  // Also strip compressed suffix at end like .png_960x960q80.png (no extension after it)
+  u = u.replace(/_(\d+x\d+)q?\d*$/, '');
+  // Now u ends with .jpg/.png/.webp — append _960x960q80 before the extension
+  u = u.replace(/\.(jpg|jpeg|png|webp)$/i, '_960x960q80.$1');
+  return u;
+}
+
+
 
 async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
   const cleanUrl = url.split('?')[0].replace(/\/$/, '');
@@ -137,8 +162,7 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
                 : (img as Record<string, unknown>).url as string
                   ?? (img as Record<string, unknown>).src as string;
               if (typeof src === 'string' && src.startsWith('http')) {
-                // Strip thumbnail size suffix to get original quality (e.g. _100x100.jpg → .jpg)
-                const hq = src.replace(/_\d+x\d+(?=\.(jpg|jpeg|png|webp))/i, '').split('?')[0];
+                const hq = toDarazHQ(src);
                 if (!allImgs.includes(hq)) allImgs.push(hq);
               }
             }
@@ -313,7 +337,10 @@ async function fetchDynamicDataRaw(url: string): Promise<{
           const img = el as HTMLImageElement;
           const src = img.src || img.dataset?.src || img.getAttribute('data-lazyload') || '';
           if (src && src.startsWith('http') && !src.includes('data:') && !src.includes('placeholder')) {
-            const hq = src.replace(/_\d+x\d+(?=\.(jpg|jpeg|png|webp))/i, '').split('?')[0];
+            // Upgrade to 960x960 quality (inline since this runs in browser context, not Node.js)
+            let hq = src.split('?')[0].replace(/\.webp$/i, '');
+            hq = hq.replace(/_\d+x\d+(?:q\d+)?(?=\.(jpg|jpeg|png|webp))/i, '');
+            hq = hq.replace(/\.(jpg|jpeg|png|webp)$/i, '_960x960q80.$1');
             if (!imgs.includes(hq)) imgs.push(hq);
           }
         });
