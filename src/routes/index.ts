@@ -5,7 +5,7 @@ import { productController }                       from '../controllers/product.
 import { cmsController }                           from '../controllers/cms.controller';
 import { blogController, reviewController }        from '../controllers/blog-review.controller';
 import { uploadController }                        from '../controllers/upload.controller';
-import { scraperController }                       from '../controllers/scraper.controller';
+import { scraperController, debugScrape }           from '../controllers/scraper.controller';
 import { messageController }                       from '../controllers/message.controller';
 import { userController }                          from '../controllers/user.controller';
 import { protect, adminOnly }                      from '../middlewares/auth.middleware';
@@ -97,6 +97,7 @@ router.post  ('/admin/upload/single',     upload.single('image'),    (req, res, 
 router.delete('/admin/upload/:filename', (req, res, next) => uploadController.deleteImage(req, res, next));
 
 // ─── Admin Daraz Scraper ───────────────────────────────────────────────────────
-router.post('/admin/scrape/daraz', (req, res, next) => scraperController.fetchDarazProduct(req, res, next));
+router.post('/admin/scrape/daraz',        (req, res, next) => scraperController.fetchDarazProduct(req, res, next));
+router.get ('/admin/scrape/daraz/debug',  (req, res) => debugScrape(req, res));
 
 export default router;

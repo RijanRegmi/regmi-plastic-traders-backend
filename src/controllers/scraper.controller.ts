@@ -16,61 +16,11 @@ interface DarazProduct {
   error?: string;
 }
 
-/* ─────────── Utilities ─────────── */
+/* ═══════════════════════════════════════════════════════════════
+   UTILITIES
+═══════════════════════════════════════════════════════════════ */
 
-/**
- * Balanced-bracket JSON extractor.
- * Finds the variable assignment in raw HTML and extracts the full JSON value
- * by counting braces — handles any size JSON without regex truncation.
- */
-function extractJsonBlock(html: string, varName: string): Record<string, unknown> | null {
-  // Look for: varName = { OR varName={
-  const markers = [`${varName} = `, `${varName}=`, `"${varName}":`];
-  let jsonStart = -1;
-
-  for (const marker of markers) {
-    const idx = html.indexOf(marker);
-    if (idx !== -1) {
-      jsonStart = html.indexOf('{', idx + marker.length - 1);
-      if (jsonStart !== -1) break;
-    }
-  }
-  if (jsonStart === -1) return null;
-
-  // Walk forward counting braces, respecting strings
-  let depth = 0;
-  let inStr = false;
-  let escape = false;
-
-  for (let i = jsonStart; i < html.length; i++) {
-    const c = html[i];
-    if (escape) { escape = false; continue; }
-    if (c === '\\' && inStr) { escape = true; continue; }
-    if (c === '"') { inStr = !inStr; continue; }
-    if (inStr) continue;
-    if (c === '{') depth++;
-    else if (c === '}') {
-      depth--;
-      if (depth === 0) {
-        try {
-          return JSON.parse(html.slice(jsonStart, i + 1)) as Record<string, unknown>;
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * Parse a Daraz price value into NPR integer.
- *
- * Daraz's internal JSON sometimes stores prices as:
- *   - integer:  5500   (already NPR)
- *   - decimal:  0.55   (÷10000 scaling → × 10000 = 5500)
- *   - string:   "5,500" or "Rs. 5,500"
- */
+/** Parse Any price value → integer NPR */
 function parseNPR(v: unknown): number | null {
   if (v === null || v === undefined) return null;
   let n: number;
@@ -82,229 +32,330 @@ function parseNPR(v: unknown): number | null {
     n = parseFloat(s);
     if (isNaN(n) || n <= 0) return null;
   }
-  // Scale-up: values < 10 are stored in 1/10000 rupee units
-  if (n > 0 && n < 10) n = Math.round(n * 10000);
+  // Daraz sometimes stores 5500 as 0.55 (÷10000 scale)
+  if (n > 0 && n < 100) n = Math.round(n * 10000);
   return n > 0 ? n : null;
 }
 
-/** Convert HTML markup to clean plain text */
-function stripHtml(html: string): string {
-  return html
+/** Strip all HTML tags → plain text */
+function stripHtml(raw: string): string {
+  return raw
     .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<\/li>/gi, '\n')
-    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/(?:p|div|li|h\d|tr)>/gi, '\n')
     .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&amp;/gi, '&')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+    .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>').replace(/&quot;/gi, '"').replace(/&#39;/gi, "'")
+    .replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/** Recursively find first numeric value at any key matching a regex */
-function deepFindNum(obj: unknown, keyRx: RegExp, d = 0): number | null {
-  if (d > 10 || !obj || typeof obj !== 'object') return null;
-  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    if (keyRx.test(k) && typeof v === 'number' && !isNaN(v) && v > 0) return v;
-    const found = deepFindNum(v, keyRx, d + 1);
-    if (found !== null) return found;
+/**
+ * Balanced-bracket JSON extractor.
+ * Handles both:  varName = {...}
+ *            and varName = JSON.parse('...')
+ */
+function extractJsonBlock(html: string, varName: string): Record<string, unknown> | null {
+  // Find assignment
+  let pos = html.indexOf(`${varName} = `);
+  if (pos === -1) pos = html.indexOf(`${varName}=`);
+  if (pos === -1) return null;
+
+  const after = html.slice(pos).replace(/^[^=]+=\s*/, ''); // everything after "="
+
+  // Case A: JSON.parse('...')
+  if (after.trimStart().startsWith('JSON.parse(')) {
+    const quoteChar = after.includes("JSON.parse('") ? "'" : '"';
+    const qStart = after.indexOf(quoteChar, after.indexOf('JSON.parse(') + 11);
+    if (qStart === -1) return null;
+    let i = qStart + 1;
+    let escaped = false;
+    while (i < after.length) {
+      if (escaped) { escaped = false; i++; continue; }
+      if (after[i] === '\\') { escaped = true; i++; continue; }
+      if (after[i] === quoteChar) break;
+      i++;
+    }
+    try { return JSON.parse(after.slice(qStart + 1, i)); } catch { return null; }
+  }
+
+  // Case B: inline JSON object {...}
+  const jsonStart = after.indexOf('{');
+  if (jsonStart === -1) return null;
+
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+
+  for (let i = jsonStart; i < after.length; i++) {
+    const c = after[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\' && inStr) { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        try { return JSON.parse(after.slice(jsonStart, i + 1)); } catch { return null; }
+      }
+    }
   }
   return null;
 }
 
-/** Recursively find first string value at any key matching a regex */
-function deepFindStr(obj: unknown, keyRx: RegExp, d = 0): string | null {
-  if (d > 10 || !obj || typeof obj !== 'object') return null;
+/** Deep find a NUMBER value by key regex (depth limited) */
+function deepNum(obj: unknown, rx: RegExp, d = 0): number | null {
+  if (d > 12 || !obj || typeof obj !== 'object') return null;
   for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    if (keyRx.test(k) && typeof v === 'string' && v.trim().length > 5) return v.trim();
-    const found = deepFindStr(v, keyRx, d + 1);
-    if (found) return found;
+    if (rx.test(k) && typeof v === 'number' && !isNaN(v) && v > 0) return v;
+    const r = deepNum(v, rx, d + 1);
+    if (r !== null) return r;
   }
   return null;
 }
 
-/** Extract all product data from a parsed __moduleData__ blob */
-function extractFromModuleData(blob: Record<string, unknown>): Partial<DarazProduct> {
-  const result: Partial<DarazProduct> = {};
-  const log: string[] = [];
+/** Deep find a STRING value by key regex (depth limited) */
+function deepStr(obj: unknown, rx: RegExp, d = 0): string | null {
+  if (d > 12 || !obj || typeof obj !== 'object') return null;
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (rx.test(k) && typeof v === 'string' && v.trim().length > 10) return v.trim();
+    const r = deepStr(v, rx, d + 1);
+    if (r) return r;
+  }
+  return null;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STRATEGY 1 — JSON-LD  (cleanest, machine-readable)
+═══════════════════════════════════════════════════════════════ */
+
+function parseJsonLd(html: string): Partial<DarazProduct> {
+  const out: Partial<DarazProduct> = {};
+  const rx = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m: RegExpExecArray | null;
+
+  while ((m = rx.exec(html)) !== null) {
+    try {
+      const doc = JSON.parse(m[1]) as Record<string, unknown>;
+      if (doc['@type'] !== 'Product') continue;
+
+      if (!out.name && typeof doc.name === 'string') out.name = doc.name;
+
+      const offers = doc.offers as Record<string, unknown> | undefined;
+      if (offers) {
+        if (!out.price) out.price = parseNPR(offers.price ?? offers.lowPrice);
+        if (!out.originalPrice) out.originalPrice = parseNPR(offers.originalPrice ?? offers.highPrice);
+      }
+
+      const agg = doc.aggregateRating as Record<string, unknown> | undefined;
+      if (agg) {
+        if (!out.rating) out.rating = parseFloat(String(agg.ratingValue)) || 0;
+        if (!out.reviewCount) out.reviewCount = parseInt(String(agg.reviewCount ?? agg.ratingCount ?? '0')) || 0;
+      }
+
+      const imgs = doc.image as unknown;
+      if (Array.isArray(imgs) && imgs.length > 0 && !out.images?.length) {
+        out.images = (imgs as string[]).filter(u => typeof u === 'string').slice(0, 8);
+      } else if (typeof imgs === 'string' && !out.images?.length) {
+        out.images = [imgs];
+      }
+    } catch { /* skip */ }
+  }
+
+  console.log(`[JSON-LD] price=${out.price} rating=${out.rating} reviews=${out.reviewCount}`);
+  return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STRATEGY 2 — Targeted regex directly on raw HTML
+   (Works even when full JSON parse fails)
+═══════════════════════════════════════════════════════════════ */
+
+function parseByRegex(html: string): Partial<DarazProduct> {
+  const out: Partial<DarazProduct> = {};
+
+  // ── Price: match "salePrice":{"value":5500  OR  "salePrice":"5500"
+  const saleRx = /"salePrice"\s*:\s*(?:\{[^}]*"value"\s*:\s*([\d.]+)|"?([\d.]+)"?)/;
+  const saleM = html.match(saleRx);
+  if (saleM) out.price = parseNPR(saleM[1] ?? saleM[2]);
+
+  // ── Original price
+  const origRx = /"originalPrice"\s*:\s*(?:\{[^}]*"value"\s*:\s*([\d.]+)|"?([\d.]+)"?)/;
+  const origM = html.match(origRx);
+  if (origM) out.originalPrice = parseNPR(origM[1] ?? origM[2]);
+
+  // ── Rating: "ratingScore":"4.7" or "averageScore":4.7 or "average":4.7
+  const ratingRx = /"(?:ratingScore|averageScore|average|rating)"\s*:\s*"?([\d.]+)"?/;
+  const ratingM = html.match(ratingRx);
+  if (ratingM) {
+    const r = parseFloat(ratingM[1]);
+    if (r > 0 && r <= 5) out.rating = r;
+  }
+
+  // ── Review count
+  const countRx = /"(?:reviewCount|totalReview|ratingCount|review_count)"\s*:\s*(\d+)/;
+  const countM = html.match(countRx);
+  if (countM) out.reviewCount = parseInt(countM[1]);
+
+  // ── Product name from <title> or og:title
+  if (!out.name) {
+    const titleM = html.match(/<title>([^<]+)<\/title>/i);
+    if (titleM) out.name = titleM[1].split('|')[0].split('-')[0].trim();
+  }
+
+  console.log(`[Regex] price=${out.price} rating=${out.rating} reviews=${out.reviewCount}`);
+  return out;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   STRATEGY 3 — __moduleData__ JSON parse (comprehensive)
+═══════════════════════════════════════════════════════════════ */
+
+function parseModuleData(html: string): Partial<DarazProduct> {
+  const out: Partial<DarazProduct> = {};
+
+  const blob = extractJsonBlock(html, '__moduleData__');
+  if (!blob) {
+    console.log('[moduleData] NOT FOUND in HTML');
+    return out;
+  }
+  console.log('[moduleData] Found, extracting...');
 
   const jData = blob?.data as Record<string, unknown> | undefined;
   const jRoot = jData?.root as Record<string, unknown> | undefined;
   const f = jRoot?.fields as Record<string, unknown> | undefined;
 
   if (!f) {
-    log.push('fields not found in blob');
-    console.log('[Scraper/Parser]', log.join(' | '));
-    return result;
+    console.log('[moduleData] fields missing from blob');
+    return out;
   }
 
-  // ── Name ──────────────────────────────────────────────────────────────────
+  // ── Name
   const prod = f.product as Record<string, unknown> | undefined;
-  const name = (prod?.title ?? prod?.name ?? prod?.displayName) as string | undefined;
-  if (typeof name === 'string' && name.length > 2) {
-    result.name = name;
-    log.push(`name="${name}"`);
-  }
+  const title = (prod?.title ?? prod?.name ?? prod?.displayName) as string | undefined;
+  if (typeof title === 'string' && title.length > 2) out.name = title;
 
-  // ── Price ─────────────────────────────────────────────────────────────────
+  // ── Price via skuInfos
   const skuInfos = (f.skuInfos ?? {}) as Record<string, Record<string, unknown>>;
-  const firstSkuId = Object.keys(skuInfos)[0];
-  if (firstSkuId) {
-    const sku = skuInfos[firstSkuId] ?? {};
+  const skuIds = Object.keys(skuInfos);
+  if (skuIds.length > 0) {
+    const sku = skuInfos[skuIds[0]] ?? {};
     const priceObj = (sku.price ?? sku) as Record<string, unknown>;
 
-    // Try deeply nested salePrice.value, originalPrice.value first
-    const salePriceBlock = priceObj?.salePrice as Record<string, unknown> | undefined;
-    const origPriceBlock = priceObj?.originalPrice as Record<string, unknown> | undefined;
+    const sp = priceObj.salePrice as Record<string, unknown> | undefined;
+    const op = priceObj.originalPrice as Record<string, unknown> | undefined;
 
-    const rawSale = salePriceBlock?.value
-      ?? priceObj?.price
-      ?? priceObj?.salePrice
-      ?? priceObj?.value;
+    const rawSale = sp?.value ?? priceObj.price ?? priceObj.salePrice;
+    const rawOrig = op?.value ?? priceObj.originalPrice;
 
-    const rawOrig = origPriceBlock?.value
-      ?? priceObj?.originalPrice
-      ?? priceObj?.retailPrice;
-
-    const pSale = parseNPR(rawSale);
-    const pOrig = parseNPR(rawOrig);
-
-    if (pSale !== null) { result.price = pSale; log.push(`price=${pSale} (raw=${rawSale})`); }
-    if (pOrig !== null) { result.originalPrice = pOrig; log.push(`origPrice=${pOrig}`); }
+    if (!out.price) out.price = parseNPR(rawSale);
+    if (!out.originalPrice) out.originalPrice = parseNPR(rawOrig);
   }
 
-  // Deep-search fallback for price if structured path failed
-  if (!result.price) {
-    const p = deepFindNum(f, /^salePrice$|^sale_price$/i);
-    if (p !== null) { result.price = parseNPR(p); log.push(`price via deepFind=${p}`); }
+  // ── Price deep search (in case skuInfos path failed)
+  if (!out.price) {
+    const pNum = deepNum(f, /^salePrice$/i);
+    if (pNum !== null) out.price = parseNPR(pNum);
   }
 
-  // ── Rating & Review Count ─────────────────────────────────────────────────
-  // Daraz typically stores under f.review.ratings.* or f.review.*
-  const reviewSection = (f.review ?? f.reviews ?? f.rating) as Record<string, unknown> | undefined;
-  if (reviewSection) {
-    const ratingsBlock = (reviewSection.ratings ?? reviewSection) as Record<string, unknown>;
-
-    const avg = ratingsBlock.average
-      ?? ratingsBlock.averageScore
-      ?? ratingsBlock.ratingScore
-      ?? ratingsBlock.score
-      ?? reviewSection.average
-      ?? reviewSection.score;
-
-    const cnt = ratingsBlock.reviewCount
-      ?? ratingsBlock.totalReview
-      ?? ratingsBlock.count
-      ?? ratingsBlock.ratingCount
-      ?? reviewSection.reviewCount
-      ?? reviewSection.totalReview
-      ?? reviewSection.count;
-
-    if (typeof avg === 'number' && avg > 0 && avg <= 5) {
-      result.rating = avg;
-      log.push(`rating=${avg}`);
-    }
-    if (typeof cnt === 'number' && cnt >= 0) {
-      result.reviewCount = cnt;
-      log.push(`reviewCount=${cnt}`);
-    }
+  // ── Rating from review section
+  const review = (f.review ?? f.reviews ?? f.ratings) as Record<string, unknown> | undefined;
+  if (review) {
+    const ratBlock = (review.ratings ?? review) as Record<string, unknown>;
+    const avg = ratBlock.average ?? ratBlock.averageScore ?? ratBlock.ratingScore ?? ratBlock.score;
+    const cnt = ratBlock.reviewCount ?? ratBlock.totalReview ?? ratBlock.count ?? ratBlock.ratingCount;
+    if (!out.rating && typeof avg === 'number' && avg > 0 && avg <= 5) out.rating = avg;
+    if (!out.reviewCount && typeof cnt === 'number') out.reviewCount = cnt;
   }
 
-  // Deep-search fallback for rating
-  if (!result.rating) {
-    const r = deepFindNum(f, /^average$|^averageScore$|^ratingScore$/i);
-    if (r !== null && r > 0 && r <= 5) {
-      result.rating = r;
-      log.push(`rating via deepFind=${r}`);
-    }
+  // Deep search fallback for rating
+  if (!out.rating) {
+    const r = deepNum(f, /^(?:average|averageScore|ratingScore|score)$/i);
+    if (r !== null && r > 0 && r <= 5) out.rating = r;
   }
-  if (!result.reviewCount) {
-    const c = deepFindNum(f, /^reviewCount$|^totalReview$|^ratingCount$/i);
-    if (c !== null) {
-      result.reviewCount = c;
-      log.push(`reviewCount via deepFind=${c}`);
-    }
+  if (!out.reviewCount) {
+    const c = deepNum(f, /^(?:reviewCount|totalReview|ratingCount|count)$/i);
+    if (c !== null) out.reviewCount = c;
   }
 
-  // ── Description ───────────────────────────────────────────────────────────
-  // Daraz description is almost always HTML in product.description or product.desc
+  // ── Description: highlights + desc, combined
+  const descParts: string[] = [];
+
+  const highlights = prod?.highlights;
+  if (Array.isArray(highlights) && highlights.length > 0) {
+    const bullets = (highlights as unknown[])
+      .map((h) => (typeof h === 'string' ? h : (h as Record<string, unknown>)?.text as string) ?? '')
+      .filter(Boolean);
+    if (bullets.length > 0) descParts.push(bullets.join('\n'));
+  }
+
   const rawDesc = (prod?.description ?? prod?.desc ?? prod?.longDescription) as string | undefined;
   if (typeof rawDesc === 'string' && rawDesc.length > 10) {
-    result.description = stripHtml(rawDesc).slice(0, 2000);
-    log.push('desc from product.description');
-  }
-
-  // Highlights array as fallback
-  if (!result.description) {
-    const highlights = prod?.highlights;
-    if (Array.isArray(highlights) && highlights.length > 0) {
-      result.description = (highlights as unknown[])
-        .map((h) => typeof h === 'string' ? h : (h as Record<string, unknown>)?.text as string ?? '')
-        .filter(Boolean)
-        .join('\n');
-      log.push('desc from highlights');
+    const clean = stripHtml(rawDesc);
+    // Avoid duplication if paragraph already in highlights
+    if (!descParts.some(p => p.includes(clean.slice(0, 40)))) {
+      descParts.push(clean);
     }
   }
 
-  // Deep string search as last resort
-  if (!result.description) {
-    const d = deepFindStr(f, /^desc$|^description$|^longDescription$/i);
-    if (d && d.length > 10) {
-      result.description = stripHtml(d).slice(0, 2000);
-      log.push('desc via deepFindStr');
-    }
+  if (descParts.length === 0) {
+    // last resort deep search
+    const d = deepStr(f, /^(?:desc|description|longDescription)$/i);
+    if (d) descParts.push(stripHtml(d));
   }
 
-  // ── Images ────────────────────────────────────────────────────────────────
-  // Try skuImages from the first SKU
+  if (descParts.length > 0) out.description = descParts.join('\n\n').slice(0, 2500);
+
+  // ── Images from skuInfos
   const imgs: string[] = [];
-  if (firstSkuId) {
-    const sku = skuInfos[firstSkuId] ?? {};
+  for (const id of skuIds.slice(0, 3)) {
+    const sku = skuInfos[id] ?? {};
     const skuImgs = (sku.skuImages ?? sku.images) as unknown[] | undefined;
     if (Array.isArray(skuImgs)) {
       for (const img of skuImgs) {
         const src = typeof img === 'string' ? img
           : ((img as Record<string, unknown>)?.url ?? (img as Record<string, unknown>)?.src) as string | undefined;
-        if (typeof src === 'string' && src.startsWith('http')) {
-          const hq = src.replace(/_\d+x\d+\.(jpg|jpeg|png|webp)/i, '_800x800.$1').split('?')[0];
-          if (!imgs.includes(hq)) imgs.push(hq);
+        if (typeof src === 'string' && src.startsWith('http') && !imgs.includes(src)) {
+          imgs.push(src.replace(/_\d+x\d+\.(jpg|jpeg|png|webp)/i, '_800x800.$1').split('?')[0]);
         }
       }
     }
   }
+  if (imgs.length > 0 && !out.images?.length) out.images = imgs.slice(0, 8);
 
-  // Also try product.images
-  if (imgs.length === 0) {
-    const pImgs = prod?.images as unknown[] | undefined;
-    if (Array.isArray(pImgs)) {
-      for (const img of pImgs) {
-        const src = typeof img === 'string' ? img
-          : ((img as Record<string, unknown>)?.url ?? (img as Record<string, unknown>)?.src) as string | undefined;
-        if (typeof src === 'string' && src.startsWith('http')) imgs.push(src);
-      }
-    }
-  }
-
-  if (imgs.length > 0) {
-    result.images = imgs.slice(0, 8);
-    log.push(`images=${imgs.length}`);
-  }
-
-  console.log('[Scraper/Parser] Extracted:', log.join(' | '));
-  return result;
+  console.log(`[moduleData] price=${out.price} rating=${out.rating} reviews=${out.reviewCount} desc=${out.description?.length ?? 0}ch`);
+  return out;
 }
 
-/* ─────────── Primary: Axios strategy ─────────── */
+/* ═══════════════════════════════════════════════════════════════
+   STRATEGY 4 — Description from raw HTML (regex on DOM content)
+═══════════════════════════════════════════════════════════════ */
 
-async function fetchDataWithAxios(url: string): Promise<Partial<DarazProduct>> {
+function parseDescriptionFromHtml(html: string): string {
+  // Daraz renders description content server-side in html-content divs
+  const patterns = [
+    /class="[^"]*html-content[^"]*"[^>]*>([\s\S]{50,5000}?)<\/div>/i,
+    /id="product_detail"[^>]*>([\s\S]{50,5000}?)<\/div>/i,
+    /class="[^"]*pdp-product-desc[^"]*"[^>]*>([\s\S]{50,5000}?)<\/div>/i,
+  ];
+
+  for (const rx of patterns) {
+    const m = html.match(rx);
+    if (m) {
+      const clean = stripHtml(m[1]);
+      if (clean.length > 30) return clean.slice(0, 2500);
+    }
+  }
+  return '';
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PRIMARY FETCHER — axios (no browser fingerprint)
+═══════════════════════════════════════════════════════════════ */
+
+async function fetchAndParse(url: string): Promise<{ data: Partial<DarazProduct>; html: string }> {
   const cleanUrl = url.split('?')[0].replace(/\/$/, '');
   const finalUrl = cleanUrl.endsWith('.html') ? cleanUrl : `${cleanUrl}.html`;
-
-  console.log(`[Scraper/Axios] Fetching: ${finalUrl}`);
+  console.log(`[Axios] GET ${finalUrl}`);
 
   const { data: html } = await axios.get<string>(finalUrl, {
     headers: {
@@ -313,52 +364,57 @@ async function fetchDataWithAxios(url: string): Promise<Partial<DarazProduct>> {
       'Accept-Language': 'en-US,en;q=0.9',
       'Accept-Encoding': 'gzip, deflate, br',
       'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
       'Sec-Fetch-Dest': 'document',
       'Sec-Fetch-Mode': 'navigate',
       'Sec-Fetch-Site': 'none',
       'Upgrade-Insecure-Requests': '1',
     },
-    timeout: 25000,
+    timeout: 20000,
     maxRedirects: 5,
   });
 
-  console.log(`[Scraper/Axios] HTML received, length=${html.length}`);
+  console.log(`[Axios] HTML length=${html.length}`);
 
-  const result: Partial<DarazProduct> = {};
+  // Log a snippet to debug what's in the HTML
+  const moduleIdx = html.indexOf('__moduleData__');
+  console.log(`[Axios] __moduleData__ found=${moduleIdx !== -1} (pos=${moduleIdx})`);
 
-  // Try to extract __moduleData__
-  const moduleData = extractJsonBlock(html, '__moduleData__');
-  if (moduleData) {
-    console.log('[Scraper/Axios] __moduleData__ found, parsing…');
-    Object.assign(result, extractFromModuleData(moduleData));
-  } else {
-    console.log('[Scraper/Axios] __moduleData__ NOT found in HTML');
-  }
+  // Run all strategies, merge results (first non-null wins per field)
+  const ldData = parseJsonLd(html);
+  const regexData = parseByRegex(html);
+  const modData = parseModuleData(html);
 
-  // Fallback: parse meta tags from HTML for name/price/image
-  if (!result.name) {
-    const ogTitle = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i)?.[1]
-      ?? html.match(/<meta[^>]+name="og:title"[^>]+content="([^"]+)"/i)?.[1];
-    if (ogTitle) result.name = ogTitle;
-  }
+  const out: Partial<DarazProduct> = {};
 
-  if (!result.price) {
-    const metaPrice = html.match(/<meta[^>]+property="product:price:amount"[^>]+content="([^"]+)"/i)?.[1];
-    if (metaPrice) result.price = parseNPR(metaPrice);
-  }
+  const merge = (field: keyof DarazProduct, ...sources: Partial<DarazProduct>[]): void => {
+    for (const src of sources) {
+      const v = src[field];
+      if (v !== undefined && v !== null && v !== '' && v !== 0) {
+        (out as Record<string, unknown>)[field] = v;
+        return;
+      }
+    }
+  };
 
-  if (!result.images || result.images.length === 0) {
-    const ogImage = html.match(/<meta[^>]+property="og:image"[^>]+content="([^"]+)"/i)?.[1];
-    if (ogImage) result.images = [ogImage];
-  }
+  // Priority: JSON-LD (most reliable) → moduleData (structure) → regex (fallback)
+  merge('name', ldData, modData, regexData);
+  merge('price', ldData, modData, regexData);
+  merge('originalPrice', ldData, modData, regexData);
+  merge('rating', ldData, modData, regexData);
+  merge('reviewCount', ldData, modData, regexData);
+  merge('images', ldData, modData);
 
-  return result;
+  // Description: moduleData is best (structured), regex on HTML as fallback
+  out.description = modData.description || parseDescriptionFromHtml(html);
+
+  return { data: out, html };
 }
 
-/* ─────────── Fallback: Puppeteer (for images & DOM scraping) ─────────── */
+/* ═══════════════════════════════════════════════════════════════
+   FALLBACK — Puppeteer (images only)
+═══════════════════════════════════════════════════════════════ */
 
-async function fetchImagesWithPuppeteer(url: string): Promise<string[]> {
+async function getImagesWithPuppeteer(url: string): Promise<string[]> {
   const isVercel = !!process.env.VERCEL || process.env.NODE_ENV === 'production';
   let browser: Browser | null = null;
 
@@ -366,12 +422,9 @@ async function fetchImagesWithPuppeteer(url: string): Promise<string[]> {
     browser = await puppeteer.launch({
       args: [
         ...(isVercel ? chromium.args : []),
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--single-process',
-        '--no-zygote',
+        '--no-sandbox', '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage', '--disable-gpu',
+        '--single-process', '--no-zygote',
       ],
       defaultViewport: { width: 1280, height: 800 },
       executablePath: isVercel
@@ -381,34 +434,23 @@ async function fetchImagesWithPuppeteer(url: string): Promise<string[]> {
     });
 
     const page = await browser.newPage();
-
     await page.setRequestInterception(true);
     page.on('request', (req) => {
-      const rt = req.resourceType();
-      if (['stylesheet', 'font', 'media'].includes(rt)) req.abort();
+      if (['stylesheet', 'font', 'media'].includes(req.resourceType())) req.abort();
       else req.continue();
     });
-
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-    );
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
 
     const cleanUrl = url.split('?')[0].replace(/\/$/, '');
     const finalUrl = cleanUrl.endsWith('.html') ? cleanUrl : `${cleanUrl}.html`;
 
-    await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 40000 });
+    await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 35000 });
     await new Promise(r => setTimeout(r, isVercel ? 4000 : 1500));
 
-    const imgs = await page.evaluate(() => {
+    return await page.evaluate(() => {
       const found: string[] = [];
-      const selectors = [
-        '.item-gallery__thumbnail img',
-        '.pdp-mod-common-image img',
-        '.gallery-preview-panel__content img',
-        '[class*="gallery"] img',
-        '[class*="thumbnail"] img',
-      ];
-      for (const sel of selectors) {
+      const sels = ['.item-gallery__thumbnail img', '.pdp-mod-common-image img', '[class*="gallery"] img', '[class*="thumbnail"] img'];
+      for (const sel of sels) {
         document.querySelectorAll(sel).forEach((el) => {
           const img = el as HTMLImageElement;
           const src = img.src || img.dataset?.src || img.getAttribute('data-lazyload') || '';
@@ -417,21 +459,21 @@ async function fetchImagesWithPuppeteer(url: string): Promise<string[]> {
             if (!found.includes(hq)) found.push(hq);
           }
         });
-        if (found.length > 0) break;
+        if (found.length) break;
       }
-      return found;
+      return found.slice(0, 8);
     });
-
-    return imgs.slice(0, 8);
   } catch (e) {
-    console.log('[Scraper/Puppeteer] Image fetch failed:', (e as Error).message);
+    console.log('[Puppeteer/Images] Failed:', (e as Error).message);
     return [];
   } finally {
-    if (browser) { try { await browser.close(); } catch { /* ignore */ } }
+    if (browser) try { await browser.close(); } catch { /* ignore */ }
   }
 }
 
-/* ─────────── Main Orchestrator ─────────── */
+/* ═══════════════════════════════════════════════════════════════
+   MAIN SCRAPER
+═══════════════════════════════════════════════════════════════ */
 
 async function scrape(url: string): Promise<DarazProduct> {
   const empty: DarazProduct = {
@@ -440,21 +482,31 @@ async function scrape(url: string): Promise<DarazProduct> {
   };
 
   let axiosData: Partial<DarazProduct> = {};
+  let axiosHtml = '';
 
   try {
-    axiosData = await fetchDataWithAxios(url);
+    const { data, html } = await fetchAndParse(url);
+    axiosData = data;
+    axiosHtml = html;
   } catch (e) {
-    console.log('[Scraper] Axios strategy failed:', (e as Error).message);
+    console.log('[Scraper] Axios failed:', (e as Error).message);
   }
 
-  // Fetch images via Puppeteer if axios didn't find any
+  // Get images: prefer axios result, fallback puppeteer
   let images = axiosData.images ?? [];
   if (images.length === 0) {
     console.log('[Scraper] No images from axios, trying puppeteer…');
-    images = await fetchImagesWithPuppeteer(url);
+    images = await getImagesWithPuppeteer(url);
   }
 
-  const merged: DarazProduct = {
+  // If og:image available in HTML, use as fallback
+  if (images.length === 0 && axiosHtml) {
+    const ogImg = axiosHtml.match(/property="og:image"\s+content="([^"]+)"/)?.[1]
+      ?? axiosHtml.match(/content="([^"]+)"\s+property="og:image"/)?.[1];
+    if (ogImg) images = [ogImg];
+  }
+
+  const result: DarazProduct = {
     name: axiosData.name ?? '',
     price: axiosData.price ?? null,
     originalPrice: axiosData.originalPrice ?? null,
@@ -466,23 +518,79 @@ async function scrape(url: string): Promise<DarazProduct> {
     success: false,
   };
 
-  if (!merged.name && merged.price === null) {
-    return {
-      ...empty,
-      error: 'Could not extract product data from Daraz. The page may have changed or is blocking requests.',
-    };
+  console.log(`[Scraper] FINAL: name="${result.name}" price=${result.price} origPrice=${result.originalPrice} rating=${result.rating} reviews=${result.reviewCount} imgs=${result.images.length} descLen=${result.description.length}`);
+
+  if (!result.name && result.price === null) {
+    return { ...empty, error: 'Could not extract product data. Daraz may be blocking or the page structure changed.' };
   }
 
-  merged.success = true;
-  console.log(
-    `[Scraper] Final: name="${merged.name}" price=${merged.price} ` +
-    `origPrice=${merged.originalPrice} rating=${merged.rating} ` +
-    `reviews=${merged.reviewCount} imgs=${merged.images.length}`
-  );
-  return merged;
+  result.success = true;
+  return result;
 }
 
-/* ─────────── Controller ─────────── */
+/* ═══════════════════════════════════════════════════════════════
+   DEBUG ENDPOINT — logs raw extraction to Vercel logs
+═══════════════════════════════════════════════════════════════ */
+
+export async function debugScrape(req: Request, res: Response): Promise<void> {
+  const { url } = req.query as { url?: string };
+  if (!url) { res.status(400).json({ error: 'url query param required' }); return; }
+
+  try {
+    const cleanUrl = (url as string).split('?')[0].replace(/\/$/, '');
+    const finalUrl = cleanUrl.endsWith('.html') ? cleanUrl : `${cleanUrl}.html`;
+
+    const { data: html } = await axios.get<string>(finalUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 20000,
+    });
+
+    const hasModuleData = html.includes('__moduleData__');
+    const hasSkuInfos = html.includes('skuInfos');
+    const hasSalePrice = html.includes('salePrice');
+    const hasRatingScore = html.includes('ratingScore') || html.includes('averageScore');
+    const hasJsonLd = html.includes('application/ld+json');
+
+    // Try to extract moduleData JSON
+    const blob = extractJsonBlock(html, '__moduleData__');
+
+    // Get a snippet of what's around salePrice
+    const spIdx = html.indexOf('"salePrice"');
+    const spSnippet = spIdx !== -1 ? html.slice(Math.max(0, spIdx - 20), spIdx + 80) : 'NOT FOUND';
+
+    const rIdx = html.indexOf('"ratingScore"');
+    const rSnippet = rIdx !== -1 ? html.slice(Math.max(0, rIdx - 10), rIdx + 60) : 'NOT FOUND';
+
+    res.json({
+      htmlLength: html.length,
+      hasModuleData,
+      hasSkuInfos,
+      hasSalePrice,
+      hasRatingScore,
+      hasJsonLd,
+      moduleDataParsed: blob !== null,
+      moduleDataKeys: blob ? Object.keys(blob) : [],
+      salePriceSnippet: spSnippet,
+      ratingSnippet: rSnippet,
+      ldData: parseJsonLd(html),
+      regexData: parseByRegex(html),
+      modDataSummary: blob ? { 
+        hasFields: !!(blob?.data as Record<string,unknown>)?.root,
+        parsed: parseModuleData(html)
+      } : null,
+    });
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   CONTROLLER
+═══════════════════════════════════════════════════════════════ */
 
 export class ScraperController {
   async fetchDarazProduct(req: Request, res: Response, next: NextFunction) {
