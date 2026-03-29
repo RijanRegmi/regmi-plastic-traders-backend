@@ -45,15 +45,6 @@ function stripHtml(raw: string): string {
     .replace(/\n{3,}/g, '\n\n').trim();
 }
 
-function deepNum(obj: unknown, rx: RegExp, d = 0): number | null {
-  if (d > 12 || !obj || typeof obj !== 'object') return null;
-  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-    if (rx.test(k) && typeof v === 'number' && !isNaN(v) && v > 0) return v;
-    const r = deepNum(v, rx, d + 1);
-    if (r !== null) return r;
-  }
-  return null;
-}
 
 /* ─────────── Step 1: axios for static data (name, desc, images) ─────────── */
 
@@ -112,6 +103,10 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
     const ogM = html.match(/property="og:title"\s+content="([^"]+)"/);
     out.name = ogM?.[1] ?? '';
   }
+  // Clean name: strip " | Daraz.com.np" and similar site suffixes
+  if (out.name) {
+    out.name = out.name.replace(/\s*[|\-–]\s*Daraz[^|]*$/i, '').trim();
+  }
 
   // ── og:description as description fallback
   if (!out.description) {
@@ -156,7 +151,7 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
   return out;
 }
 
-/* ─────────── Step 2: Puppeteer to intercept dynamic price/rating API ─────────── */
+/* ─────────── Step 2: Puppeteer — wait for JS-rendered price and rating ─────────── */
 
 async function fetchDynamicData(url: string): Promise<{
   price: number | null;
@@ -186,7 +181,6 @@ async function fetchDynamicData(url: string): Promise<{
 
     const page = await browser.newPage();
 
-    // Intercept every response and capture pricing/rating API calls
     const capturedData = {
       price: null as number | null,
       originalPrice: null as number | null,
@@ -194,24 +188,28 @@ async function fetchDynamicData(url: string): Promise<{
       reviewCount: 0,
     };
 
-    // Block heavy resources to speed up
+    // Block images/fonts/css to speed up — keep scripts and XHR (needed for price API calls)
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const rt = req.resourceType();
-      const u = req.url();
-      // Keep: document, script (for JS execution), xhr/fetch (API calls)
-      if (['image', 'stylesheet', 'font', 'media'].includes(rt) &&
-          !u.includes('thumbnail') && !u.includes('gallery')) {
+      if (['stylesheet', 'font', 'media'].includes(rt)) {
         req.abort();
+      } else if (rt === 'image') {
+        // Allow only tiny images (thumbnails) to avoid blocking gallery detection
+        const u = req.url();
+        if (u.includes('placeholder') || u.includes('logo') || (!u.includes('daraz') && !u.includes('lazada'))) {
+          req.abort();
+        } else {
+          req.continue();
+        }
       } else {
         req.continue();
       }
     });
 
-    // Listen to network responses for Daraz's price API
+    // Intercept API responses that contain price/rating data
     page.on('response', async (response: HTTPResponse) => {
       const u = response.url();
-      // Daraz fetches price via mtop or similar API — intercept any JSON with price data
       if (
         u.includes('mtop') || u.includes('getPrice') ||
         u.includes('itemDetail') || u.includes('pdp') ||
@@ -223,12 +221,11 @@ async function fetchDynamicData(url: string): Promise<{
           const json = await response.json() as Record<string, unknown>;
           const raw = JSON.stringify(json);
 
-          // Price patterns in API responses
           if (raw.includes('salePrice') || raw.includes('sale_price') || raw.includes('"price"')) {
             const pM = raw.match(/"(?:salePrice|sale_price|discountedPrice|currentPrice)"\s*:\s*([\d.]+)/);
             if (pM) {
               const p = parseNPR(pM[1]);
-              if (p !== null) { capturedData.price = p; console.log(`[intercept] price=${p} from ${u}`); }
+              if (p !== null) { capturedData.price = p; console.log(`[intercept] price=${p}`); }
             }
             const oM = raw.match(/"(?:originalPrice|original_price|retailPrice)"\s*:\s*([\d.]+)/);
             if (oM) {
@@ -237,12 +234,11 @@ async function fetchDynamicData(url: string): Promise<{
             }
           }
 
-          // Rating patterns
           if (raw.includes('rating') || raw.includes('Rating') || raw.includes('score')) {
             const rM = raw.match(/"(?:ratingScore|averageScore|average|ratingValue)"\s*:\s*([\d.]+)/);
             if (rM) {
               const r = parseFloat(rM[1]);
-              if (r > 0 && r <= 5) { capturedData.rating = r; console.log(`[intercept] rating=${r} from ${u}`); }
+              if (r > 0 && r <= 5) { capturedData.rating = r; console.log(`[intercept] rating=${r}`); }
             }
             const cM = raw.match(/"(?:reviewCount|review_count|ratingCount|totalReview)"\s*:\s*(\d+)/);
             if (cM) { capturedData.reviewCount = parseInt(cM[1]); }
@@ -256,70 +252,69 @@ async function fetchDynamicData(url: string): Promise<{
     const cleanUrl = url.split('?')[0].replace(/\/$/, '');
     const finalUrl = cleanUrl.endsWith('.html') ? cleanUrl : `${cleanUrl}.html`;
 
-    await page.goto(finalUrl, { waitUntil: 'networkidle0', timeout: 50000 });
+    // domcontentloaded (not networkidle0!) — Daraz has infinite tracking pings
+    // that would make networkidle0 never resolve on Vercel
+    await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-    // Also extract from rendered DOM after full load
+    // Wait for THE sale price element — confirmed selector from actual Daraz HTML inspection
+    // This element is added by React AFTER the JS price API call completes (~5-10s)
+    try {
+      await page.waitForSelector('.pdp-price_type_normal', { timeout: 22000 });
+      console.log('[puppeteer] .pdp-price_type_normal found');
+    } catch {
+      console.log('[puppeteer] price selector timed out — extracting whatever is available');
+    }
+
+    // Brief wait for rating to render (loads just after price)
+    await new Promise(r => setTimeout(r, 1000));
+
     const domData = await page.evaluate(() => {
-      const getText = (sel: string) => (document.querySelector(sel) as HTMLElement)?.innerText?.trim() ?? '';
       const getNum = (s: string) => parseFloat(s.replace(/[^\d.]/g, '')) || 0;
+      const getText = (sel: string) => (document.querySelector(sel) as HTMLElement)?.innerText?.trim() ?? '';
 
-      // Price from DOM
+      // Sale price
       let price: number | null = null;
-      const priceSelectors = [
-        '.pdp-price_type_normal',
-        '.pdp-price:not(.pdp-price_type_deleted)',
-        '[class*="pdp-price"]:not([class*="deleted"]):not([class*="original"])',
-        '.pdp-mod-product-badge-price span',
-      ];
-      for (const sel of priceSelectors) {
-        const el = document.querySelector(sel) as HTMLElement | null;
-        if (el?.innerText) {
-          const n = getNum(el.innerText);
+      for (const sel of ['.pdp-price_type_normal', '.pdp-mod-product-badge-price .pdp-price']) {
+        const els = document.querySelectorAll(sel);
+        for (let i = 0; i < els.length; i++) {
+          const n = getNum((els[i] as HTMLElement).innerText ?? '');
           if (n > 100) { price = n; break; }
         }
+        if (price !== null) break;
       }
 
       // Original/crossed price
       let originalPrice: number | null = null;
-      const origEl = document.querySelector('.pdp-price_type_deleted, [class*="price-del"]') as HTMLElement | null;
-      if (origEl?.innerText) {
-        const n = getNum(origEl.innerText);
-        if (n > 100) originalPrice = n;
-      }
+      const origTxt = getText('.pdp-price_type_deleted');
+      if (origTxt) { const n = getNum(origTxt); if (n > 100) originalPrice = n; }
 
-      // Rating
+      // Rating: .score-average renders "4.7" after JS load
       let rating = 0;
-      const ratingSelectors = ['.score-average', '[class*="score-average"]', '.pdp-review-summary-score'];
-      for (const sel of ratingSelectors) {
-        const t = getText(sel);
-        const r = parseFloat(t);
-        if (r > 0 && r <= 5) { rating = r; break; }
+      const scoreEl = document.querySelector('.score-average') as HTMLElement | null;
+      if (scoreEl?.innerText) {
+        const r = parseFloat(scoreEl.innerText.trim());
+        if (r > 0 && r <= 5) rating = r;
       }
 
-      // Review count from DOM (e.g. "Ratings 20" or ".count-content")
+      // Review count: .pdp-review-summary__link renders "Ratings 20" after JS
+      // (starts as "No Ratings" in initial HTML — ignore that)
       let reviewCount = 0;
-      const cntSelectors = ['.count-content', '.pdp-review-summary-count', '[class*="count-content"]'];
-      for (const sel of cntSelectors) {
-        const t = getText(sel).replace(/[^\d]/g, '');
-        const n = parseInt(t, 10);
-        if (!isNaN(n) && n >= 0) { reviewCount = n; break; }
-      }
-      // Also look for "Ratings N" text pattern
-      if (!reviewCount) {
-        const ratingLink = document.querySelector('.pdp-review-summary__link, [class*="rating-link"]');
-        const linkTxt = (ratingLink as HTMLElement)?.innerText ?? '';
-        const ratingNumM = linkTxt.match(/(\d+)/);
-        if (ratingNumM) reviewCount = parseInt(ratingNumM[1]);
+      const linkEl = document.querySelector('.pdp-review-summary__link') as HTMLElement | null;
+      if (linkEl?.innerText) {
+        const txt = linkEl.innerText.trim();
+        if (txt && !txt.toLowerCase().startsWith('no')) {
+          const m = txt.match(/(\d+)/);
+          if (m) reviewCount = parseInt(m[1]);
+        }
       }
 
-      // Gallery images from DOM
+      // Gallery images
       const imgs: string[] = [];
-      const imgSels = ['.item-gallery__thumbnail img', '.pdp-mod-common-image img', '[class*="gallery"] img'];
-      for (const sel of imgSels) {
+      for (const sel of ['.item-gallery__thumbnail img', '.pdp-mod-common-image img', '[class*="gallery"] img']) {
         document.querySelectorAll(sel).forEach((el) => {
           const img = el as HTMLImageElement;
-          const src = img.src || img.dataset?.src || '';
-          if (src && src.startsWith('http') && !src.includes('placeholder') && !src.includes('data:')) {
+          const src = img.src || img.dataset?.src || img.getAttribute('data-lazyload') || '';
+          if (src && src.startsWith('http') && !src.includes('data:') && !src.includes('placeholder')) {
             const hq = src.replace(/_\d+x\d+\.(jpg|jpeg|png|webp)/i, '_800x800.$1').split('?')[0];
             if (!imgs.includes(hq)) imgs.push(hq);
           }
@@ -330,8 +325,7 @@ async function fetchDynamicData(url: string): Promise<{
       return { price, originalPrice, rating, reviewCount, images: imgs.slice(0, 8) };
     });
 
-    console.log(`[puppeteer DOM] price=${domData.price} rating=${domData.rating} reviews=${domData.reviewCount} imgs=${domData.images.length}`);
-    console.log(`[puppeteer intercept] price=${capturedData.price} rating=${capturedData.rating} reviews=${capturedData.reviewCount}`);
+    console.log(`[puppeteer DOM] price=${domData.price} origPrice=${domData.originalPrice} rating=${domData.rating} reviews=${domData.reviewCount} imgs=${domData.images.length}`);
 
     return {
       price: capturedData.price ?? domData.price,
