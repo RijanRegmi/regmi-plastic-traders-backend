@@ -6,7 +6,7 @@ const CmsSectionSchema = new Schema<ICmsSection>(
     page: {
       type: String,
       required: true,
-      enum: ['home', 'products', 'about', 'contact', 'blog', 'global'],
+      enum: ['home', 'products', 'about', 'contact', 'blog', 'global', 'seo'],
     },
     key: { type: String, required: true, trim: true },
     value: { type: Schema.Types.Mixed, required: true },
