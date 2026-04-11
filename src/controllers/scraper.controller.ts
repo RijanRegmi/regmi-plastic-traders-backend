@@ -25,12 +25,12 @@ function parseNPR(v: unknown): number | null {
     if (isNaN(v) || v <= 0) return null;
     n = v;
   } else {
-    const s = String(v).replace(/[^\d.]/g, '');
-    n = parseFloat(s);
+    const s = String(v);
+    const m = s.match(/[\d,]+(?:\.\d+)?/);
+    if (!m) return null;
+    n = parseFloat(m[0].replace(/,/g, ''));
     if (isNaN(n) || n <= 0) return null;
   }
-  // Daraz sometimes scales price by 1/10000
-  if (n > 0 && n < 100) n = Math.round(n * 10000);
   return n > 0 ? n : null;
 }
 
@@ -66,8 +66,10 @@ function toDarazHQ(src: string): string {
   u = u.replace(/_\d+x\d+(?:q\d+)?(?=\.(jpg|jpeg|png|webp))/i, '');
   // Also strip compressed suffix at end like .png_960x960q80.png (no extension after it)
   u = u.replace(/_(\d+x\d+)q?\d*$/, '');
-  // Now u ends with .jpg/.png/.webp — append _960x960q80 before the extension
-  u = u.replace(/\.(jpg|jpeg|png|webp)$/i, '_960x960q80.$1');
+  // Remove messy double extensions
+  u = u.replace(/\.(png|jpg|jpeg)_.+$/i, '.$1');
+  
+  // Return the raw source image URL which never 404s.
   return u;
 }
 
@@ -145,12 +147,25 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
   if (trackingPriceM) {
     // pdt_price is the ORIGINAL price (before discount)
     out.originalPrice = parseNPR(trackingPriceM[1]);
-    console.log(`[axios] pdt_price (original)="${trackingPriceM[1]}" → ${out.originalPrice}`);
   }
+
+  // Look for any obvious sale price in state
+  const salePriceM = html.match(/"(?:salePrice|price|discountPrice)"\s*:\s*([\d.]+)/);
+  if (salePriceM) {
+    const sp = parseNPR(salePriceM[1]);
+    if (sp !== null && (!out.originalPrice || sp <= out.originalPrice)) out.price = sp;
+  }
+
+  // Look for standard rating and review count properties
+  const scoreM = html.match(/"(?:average|ratingScore)"\s*:\s*([\d.]+)/);
+  if (scoreM) out.rating = parseFloat(scoreM[1]) || 0;
+  
+  const rcM = html.match(/"(?:rateCount|reviewCount)"\s*:\s*(\d+)/);
+  if (rcM) out.reviewCount = parseInt(rcM[1]) || 0;
 
   // ── Images from skuGalleries in moduleData
   if (modIdx !== -1) {
-    const galleryM = html.slice(modIdx, modIdx + 50000).match(/"skuGalleries"\s*:\s*(\{[\s\S]*?\})\s*,\s*"skuInfos"/);
+    const galleryM = html.slice(modIdx, modIdx + 30000).match(/"skuGalleries"\s*:\s*(\{[^{}]+\})/);
     if (galleryM) {
       try {
         const galleries = JSON.parse(galleryM[1]) as Record<string, unknown[]>;
@@ -158,12 +173,15 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
         for (const imgs of Object.values(galleries)) {
           if (Array.isArray(imgs)) {
             for (const img of imgs) {
-              const src = typeof img === 'string' ? img
+              let src = typeof img === 'string' ? img
                 : (img as Record<string, unknown>).url as string
                   ?? (img as Record<string, unknown>).src as string;
-              if (typeof src === 'string' && src.startsWith('http')) {
-                const hq = toDarazHQ(src);
-                if (!allImgs.includes(hq)) allImgs.push(hq);
+              if (typeof src === 'string') {
+                if (src.startsWith('//')) src = 'https:' + src;
+                if (src.startsWith('http')) {
+                  const hq = toDarazHQ(src);
+                  if (!allImgs.includes(hq)) allImgs.push(hq);
+                }
               }
             }
           }
@@ -171,6 +189,34 @@ async function fetchStaticData(url: string): Promise<Partial<DarazProduct>> {
         if (allImgs.length > 0) out.images = allImgs.slice(0, 8);
       } catch { /* skip */ }
     }
+  }
+
+  // ── Broad Image Extraction Fallback ──
+  if (!out.images || out.images.length === 0) {
+    const pUrls = html.match(/(?:https?:)?\/\/[a-zA-Z0-9.-]+\.slatic\.net\/(?:p|kf)\/[-a-zA-Z0-9._]+?(?:\.jpg|\.jpeg|\.png|\.webp)/gi) || [];
+    const lUrls = html.match(/(?:https?:)?\/\/[a-zA-Z0-9.-]+\.lazcdn\.com(?:[a-zA-Z0-9./_-]+)?\/(?:p|kf)\/[-a-zA-Z0-9._]+?(?:\.jpg|\.jpeg|\.png|\.webp)/gi) || [];
+    const dUrls = html.match(/(?:https?:)?\/\/[a-zA-Z0-9.-]+\.daraz\.[a-z.]+\/p\/[-a-zA-Z0-9._]+?(?:\.jpg|\.jpeg|\.png|\.webp)/gi) || [];
+
+    const allFound = [...pUrls, ...lUrls, ...dUrls];
+    
+    const hqImages: string[] = [];
+    allFound.forEach(u => {
+      let full = u;
+      if (full.startsWith('//')) full = 'https:' + full;
+      // Skip irrelevant icons
+      if (full.includes('icon') || full.includes('avatar') || full.includes('T1R')) return;
+      
+      const hq = toDarazHQ(full);
+      if (!hqImages.includes(hq)) hqImages.push(hq);
+    });
+    
+    if (hqImages.length > 0) out.images = hqImages.slice(0, 8);
+  }
+
+  // Final fallback to og:image
+  if (!out.images || out.images.length === 0) {
+    const ogImg = html.match(/property="og:image"\s+content="([^"]+)"/);
+    if (ogImg) out.images = [toDarazHQ(ogImg[1])];
   }
 
   console.log(`[axios] name="${out.name}" origPrice=${out.originalPrice} imgs=${out.images?.length ?? 0} descLen=${out.description?.length ?? 0}`);
@@ -239,15 +285,15 @@ async function fetchDynamicDataRaw(url: string): Promise<{
           const raw = JSON.stringify(json);
 
           if (raw.includes('salePrice') || raw.includes('sale_price') || raw.includes('"price"')) {
-            const pM = raw.match(/"(?:salePrice|sale_price|discountedPrice|currentPrice)"\s*:\s*([\d.]+)/);
+            const pM = raw.match(/"(?:salePrice|sale_price|discountedPrice|currentPrice|price)"\s*:\s*([\d.]+)/);
             if (pM) { const p = parseNPR(pM[1]); if (p !== null) capturedData.price = p; }
             const oM = raw.match(/"(?:originalPrice|original_price|retailPrice)"\s*:\s*([\d.]+)/);
             if (oM) { const op = parseNPR(oM[1]); if (op !== null) capturedData.originalPrice = op; }
           }
-          if (raw.includes('rating') || raw.includes('Rating') || raw.includes('score')) {
+          if (raw.includes('rating') || raw.includes('Rating') || raw.includes('score') || raw.includes('rateCount')) {
             const rM = raw.match(/"(?:ratingScore|averageScore|average|ratingValue)"\s*:\s*([\d.]+)/);
             if (rM) { const r = parseFloat(rM[1]); if (r > 0 && r <= 5) capturedData.rating = r; }
-            const cM = raw.match(/"(?:reviewCount|review_count|ratingCount|totalReview)"\s*:\s*(\d+)/);
+            const cM = raw.match(/"(?:reviewCount|review_count|ratingCount|totalReview|rateCount)"\s*:\s*(\d+)/);
             if (cM) capturedData.reviewCount = parseInt(cM[1]);
           }
         } catch { /* skip non-JSON */ }
@@ -285,14 +331,17 @@ async function fetchDynamicDataRaw(url: string): Promise<{
     }
 
     const domData = await page.evaluate(() => {
-      const getNum = (s: string) => parseFloat(s.replace(/[^\d.]/g, '')) || 0;
+      const getNum = (s: string) => {
+        const match = s.match(/[\d,]+(?:\.\d+)?/);
+        return match ? parseFloat(match[0].replace(/,/g, '')) : 0;
+      };
 
       // Sale price — try partial class match for resilience
       let price: number | null = null;
       const priceEls = document.querySelectorAll('[class*="pdp-price_type_normal"]');
       for (let i = 0; i < priceEls.length; i++) {
         const n = getNum((priceEls[i] as HTMLElement).innerText ?? '');
-        if (n > 100) { price = n; break; }
+        if (n > 10) { price = n; break; }
       }
 
       // Original/crossed price
@@ -300,7 +349,7 @@ async function fetchDynamicDataRaw(url: string): Promise<{
       const origEls = document.querySelectorAll('[class*="pdp-price_type_deleted"]');
       for (let i = 0; i < origEls.length; i++) {
         const n = getNum((origEls[i] as HTMLElement).innerText ?? '');
-        if (n > 100) { originalPrice = n; break; }
+        if (n > 10) { originalPrice = n; break; }
       }
 
       // Rating — try multiple selectors, also try aria-label on star elements
@@ -335,12 +384,10 @@ async function fetchDynamicDataRaw(url: string): Promise<{
       for (const sel of ['.item-gallery__thumbnail img', '.pdp-mod-common-image img', '[class*="gallery"] img']) {
         document.querySelectorAll(sel).forEach((el) => {
           const img = el as HTMLImageElement;
-          const src = img.src || img.dataset?.src || img.getAttribute('data-lazyload') || '';
+          let src = img.getAttribute('data-lazyload') || img.src || img.dataset?.src || '';
+          if (src.startsWith('//')) src = 'https:' + src;
           if (src && src.startsWith('http') && !src.includes('data:') && !src.includes('placeholder')) {
-            // Upgrade to 960x960 quality (inline since this runs in browser context, not Node.js)
-            let hq = src.split('?')[0].replace(/\.webp$/i, '');
-            hq = hq.replace(/_\d+x\d+(?:q\d+)?(?=\.(jpg|jpeg|png|webp))/i, '');
-            hq = hq.replace(/\.(jpg|jpeg|png|webp)$/i, '_960x960q80.$1');
+            const hq = toDarazHQ(src);
             if (!imgs.includes(hq)) imgs.push(hq);
           }
         });
@@ -416,12 +463,12 @@ async function scrape(url: string): Promise<DarazProduct> {
 
   const result: DarazProduct = {
     name: sd.name ?? '',
-    price: dd.price,
+    price: dd.price ?? sd.price ?? null,
     originalPrice: dd.originalPrice ?? sd.originalPrice ?? null,
     description: sd.description ?? '',
     images: (dd.images.length > 0 ? dd.images : sd.images) ?? [],
-    rating: dd.rating,
-    reviewCount: dd.reviewCount,
+    rating: dd.rating || sd.rating || 0,
+    reviewCount: dd.reviewCount || sd.reviewCount || 0,
     category: '',
     success: false,
   };
